@@ -1,0 +1,1590 @@
+---
+title: "SomaScan analysis of PD dementia"
+author: "Raquel Real"
+date: "27/06/2026"
+---
+
+# Set working directory
+```{r}
+#setwd("/path/to/working/directory")
+setwd("/Users/raquelreal/Documents/Manuscripts/SomaScan/Test_code/")
+```
+
+# Load libraries
+```{r}
+library(SomaDataIO)
+library(tidyverse)
+library(tidyr)
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(ggrepel)
+library(survival)
+library(Biobase)
+library(limma)
+library(sva)
+library(metafor)
+library(broom)
+library(CMAverse)
+library(UpSetR)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(stringr)
+library(STRINGdb)
+library(GOSemSim)
+```
+
+# Load data
+```{r}
+#Discovery cohort
+# load the SomaScan data 
+soma_data_discovery <- read_adat("data/soma_data.adat", debug = FALSE, verbose = getOption("verbose"))
+
+# load the sample clinical data
+clinical_data_discovery <- fread("data/clinical_data.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+
+
+#Replication cohort
+# load the SomaScan data 
+soma_data_replication <- read_adat("data/soma_data.adat", debug = FALSE, verbose = getOption("verbose"))
+
+# load the sample clinical data
+clinical_data_replication <- fread("data/clinical_data.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+```
+
+# Clean the SomaScan data
+```{r}
+#Discovery cohort
+# remove the rows (samples)that have failed the quality control
+soma_data_discovery_PASS <- soma_data_discovery %>% filter(RowCheck == "PASS")
+
+# remove the non-human proteins
+AptamerNonHuman <- attributes(soma_data_discovery_PASS)$Col.Meta %>% filter(Organism != "Human" | Type != "Protein") %>% dplyr::select(SeqId)
+AptamerNonHuman <- as.data.frame(AptamerNonHuman)
+AptamerNonHuman$SeqId = paste0('seq.', AptamerNonHuman$SeqId)
+AptamerNonHuman$SeqId <- sub('-', '.', AptamerNonHuman$SeqId, fixed = TRUE)
+
+soma_data_discovery_PASS = soma_data_discovery_PASS %>% dplyr::select(!AptamerNonHuman[,1])
+
+
+#Replication cohort
+# remove the rows (samples)that have failed the quality control
+soma_data_replication_PASS <- soma_data_replication %>% filter(RowCheck == "PASS")          
+
+# remove the non-human proteins     
+AptamerNonHuman <- attributes(soma_data_replication_PASS)$Col.Meta %>% filter(Organism != "Human" | Type != "Protein") %>% dplyr::select(SeqId)
+AptamerNonHuman <- as.data.frame(AptamerNonHuman)
+AptamerNonHuman$SeqId = paste0('seq.', AptamerNonHuman$SeqId)
+AptamerNonHuman$SeqId <- sub('-', '.', AptamerNonHuman$SeqId, fixed = TRUE)
+
+soma_data_replication_PASS = soma_data_replication_PASS %>% dplyr::select(!AptamerNonHuman[,1])
+```
+
+# Merge the SomaScan data with the clinical data
+```{r}
+#Discovery cohort
+merged_data_discovery <- inner_join(soma_data_discovery_PASS, clinical_data_discovery, by = c("SampleId" = "ID"))
+
+#Replication cohort
+merged_data_replication <- inner_join(soma_data_replication_PASS, clinical_data_replication, by = c("SampleId" = "ID"))
+```
+
+# Identify outliers in the SomaScan data
+```{r}
+#Discovery cohort
+# identify outliers based on mean signal
+merged_data_trim <- merged_data_discovery %>% dplyr::select(SampleId, starts_with("seq."))
+rownames(merged_data_trim) <- merged_data_trim[,1] #convert sampleIDs into row names
+merged_data_trim <- merged_data_trim %>% 
+  dplyr::select(-SampleId) %>% log2() 
+
+mean_signal <- rowMeans(merged_data_trim, na.rm = TRUE)
+Q3 <- quantile(mean_signal, 0.75)
+IQR_val <- IQR(mean_signal)
+upper <- Q3 + 3*IQR_val   
+
+suspects <- names(mean_signal[mean_signal > upper])
+
+# create a boxplot to visualize the outliers
+jpeg('discovery_outliers.jpg', res = 150, pointsize = 8)
+boxplot(mean_signal,  xlab = "Discovery", ylab="Mean protein level", ylim = range(11.8:12.8), yaxs = "i")
+abline(h=upper, col="red", lwd=2, lty="dotdash")
+dev.off()
+
+# remove the outliers from the merged data
+merged_data_discovery_clean <- merged_data_discovery %>% filter(!SampleId %in% suspects)
+
+
+#Replication cohort
+# identify outliers based on mean signal
+merged_data_trim <- merged_data_replication %>% dplyr::select(SampleId, starts_with("seq."))
+rownames(merged_data_trim) <- merged_data_trim[,1] #convert sampleIDs into row names
+merged_data_trim <- merged_data_trim %>%
+  dplyr::select(-SampleId) %>% log2()      
+
+mean_signal <- rowMeans(merged_data_trim, na.rm = TRUE)
+Q3 <- quantile(mean_signal, 0.75)
+IQR_val <- IQR(mean_signal)
+upper <- Q3 + 3*IQR_val   
+
+suspects <- names(mean_signal[mean_signal > upper])
+
+# create a boxplot to visualize the outliers
+jpeg('replication_outliers.jpg', res = 150, pointsize = 8)
+boxplot(mean_signal,  xlab = "Replication", ylab="Mean protein level", ylim = range(11.8:12.8), yaxs = "i")
+abline(h=upper, col="red", lwd=2, lty="dotdash")
+dev.off()
+
+# remove the outliers from the merged data
+merged_data_replication_clean <- merged_data_replication %>% filter(!SampleId %in% suspects)
+```
+
+# Calculate surrogate variables for the SomaScan data
+```{r}
+#Discovery cohort
+# prepare the data for surrogate variable analysis
+merged_data_log <- merged_data_discovery_clean %>% dplyr::select(SampleId, starts_with("seq."))
+rownames(merged_data_log) <- merged_data_log[,1] #convert sampleIDs into row names
+merged_data_log <- merged_data_log %>%
+  dplyr::select(-SampleId) %>% log2()
+
+# create a model matrix for the clinical variables
+clinical_vars <- merged_data_discovery_clean %>% dplyr::select(SampleId, event, PlateId)
+rownames(clinical_vars) <- clinical_vars[,1] 
+
+# perform surrogate variable analysis
+X <- t(as.matrix(merged_data_log))
+mod  <- model.matrix(~ as.factor(event), data = clinical_vars)
+mod0 <- model.matrix(~ 1, data = clinical_vars)
+
+svobj <- sva(
+  X,
+  mod,
+  mod0,
+  n.sv = 3
+)
+
+# Add the surrogate variables to the clinical data
+merged_data_discovery_clean$SV1 <- svobj$sv[,1]
+merged_data_discovery_clean$SV2 <- svobj$sv[,2]
+merged_data_discovery_clean$SV3 <- svobj$sv[,3]
+
+#Replication cohort
+# prepare the data for surrogate variable analysis
+merged_data_log <- merged_data_replication_clean %>% dplyr::select(SampleId, starts_with("seq."))
+rownames(merged_data_log) <- merged_data_log[,1] #convert sampleIDs into row names
+merged_data_log <- merged_data_log %>%
+  dplyr::select(-SampleId) %>% log2()
+
+# create a model matrix for the clinical variables
+clinical_vars <- merged_data_replication_clean %>% dplyr::select(SampleId, event, PlateId)
+rownames(clinical_vars) <- clinical_vars[,1] 
+
+# perform surrogate variable analysis
+X <- t(as.matrix(merged_data_log))
+mod  <- model.matrix(~ as.factor(event), data = clinical_vars)
+mod0 <- model.matrix(~ 1, data = clinical_vars)
+
+svobj <- sva(
+  X,
+  mod,
+  mod0,
+  n.sv = 3
+)
+
+# Add the surrogate variables to the clinical data
+merged_data_replication_clean$SV1 <- svobj$sv[,1]
+merged_data_replication_clean$SV2 <- svobj$sv[,2]
+merged_data_replication_clean$SV3 <- svobj$sv[,3]
+```
+
+# Z- and log2 transform the SomaScan data 
+```{r}
+# function to identify SomaScan protein columns and to center and scale the data
+is_seq <- function(.x) grepl("^seq\\.[0-9]{4}", .x) 
+cs <- function(.x) {    
+  out <- .x - mean(.x)  
+  out / sd(out)        
+}
+
+#Discovery cohort
+# prepare final data set for analysis
+cleanData_discovery <- merged_data_discovery_clean %>%
+  drop_na(event) %>%                            # rm NAs if present
+  mutate(across(matches("^seq\\.[0-9]{4}"), ~ cs(log2(.x))))
+
+
+#Replication cohort
+# prepare final data set for analysis
+cleanData_replication <- merged_data_replication_clean %>%
+  drop_na(event) %>%                            # rm NAs if present
+  mutate(across(matches("^seq\\.[0-9]{4}"), ~ cs(log2(.x))))    
+```
+
+# Survival analysis Discovery cohort
+```{r}
+# keep only columns of interest
+cleanData_survival <- cleanData_discovery %>% 
+  dplyr::select(SampleId,event,time.event,sex,age_baseline,SV1,SV2,SV3,starts_with("seq."))
+
+cleanData_survival$event <- with(cleanData_survival, ifelse(event == "normal", 0, 
+                                                      ifelse(event == "dementia", 1, NA)))
+
+TABLE <- as.data.frame(cleanData_survival)
+TABLE$time.event <- as.numeric(TABLE$time.event)
+TABLE <- drop_na(TABLE,event)
+	
+	coefficients<-as.data.frame(matrix(ncol= 10))
+ 
+	names(coefficients) <- c("AptName","Coeff", "se", "Pvalue", "Cox.zphPVal", "N", "ov.lik.ratio","logrank", "r2", "BIC" )
+ 
+	for (i in 9:ncol(TABLE)) {
+	print(colnames(TABLE)[i])
+  	protein <- TABLE[,c(i,1:8)]
+	j= i-8
+
+# test Cox model - if there is an error then put NoConverge into results
+  	testCox = try(coxph(Surv(protein$time.event, protein$event) ~ protein[,1] + protein$age_baseline + protein$sex + protein$SV1 + protein$SV2 + protein$SV3, data=protein), 
+  	              silent = T)
+  	
+  	if(class(testCox)[1]=="try-error"){
+  	  coefficients[j,1]<- paste(colnames(TABLE)[i])
+  	  coefficients[j,2:9] <- "NoConverge"
+  	} else {
+  	
+  	# if Cox model is not an error, run and get the coefficients
+  	model.cox<- coxph(Surv(protein$time.event, protein$event) ~ protein[,1] + protein$age_baseline + protein$sex + protein$SV1 + protein$SV2 + protein$SV3, data=protein)
+  	
+  	testkmz <- try(kmz<- cox.zph(model.cox, transform = "km"), silent = T)
+  	
+  	coefficients[j,1]<- paste(colnames(TABLE)[i])
+  	coefficients[j,2]<- summary(model.cox)$coefficients[1,1]
+  	coefficients[j,3]<- summary(model.cox)$coefficients[1,3]
+  	coefficients[j,4]<- summary(model.cox)$coefficients[1,5]
+  	coefficients[j,6]<- model.cox$n
+  	coefficients[j,7]<- summary(model.cox)$logtest[[1]]
+  	coefficients[j,8]<- summary(model.cox)$sctest[[1]]
+  	coefficients[j,9]<- summary(model.cox)$rsq[[1]] # nagelkerke r square
+  	coefficients[j,10] <- BIC(model.cox)
+  	
+  	# if kmz is not an error, get the Cox.zphPVal
+  	if(class(testkmz)[1] == "try-error"){
+  	coefficients[j,5]<- "solveError"
+  	} else {
+  	coefficients[j,5]<- kmz$table[1,3]
+  	}
+  	}
+  	}
+
+# Add protein names to the coefficients table
+    prot_list <- getAnalyteInfo(soma_data_discovery_PASS)%>% dplyr::select(AptName, EntrezGeneSymbol)
+	coefficients$Protein <- prot_list$EntrezGeneSymbol[match(coefficients$AptName,prot_list$AptName)]
+	  
+# FDR adjusted P-values
+	coefficients$AdjP <- p.adjust(coefficients$Pvalue, method = "fdr")
+
+# Save output for meta-analysis
+    fwrite(coefficients,"discovery_SomaScan_survival_SVs.txt", sep = "\t", quote = F, row.names = F, col.names = T) #full output
+
+        #nominally significant protein list for meta-analysis
+        sig_proteins_cph_dementia <- coefficients %>% filter(Pvalue<0.05)
+        sig_proteins_cph_dementia <- sig_proteins_cph_dementia$AptName
+
+        write.table(sig_proteins_cph_dementia, "discovery_nominal_associations_dementia_cph_SVs.txt", quote = F, row.names = F, col.names = F) 
+```
+
+# Survival analysis Replication cohort
+```{r}
+#Select proteins significant in the Discovery cohort
+cleanData_survival <- cleanData_replication %>% 
+  dplyr::select(SampleId,event,time.event,sex,age_baseline,SV1,SV2,SV3,all_of(sig_proteins_cph_dementia))     
+
+cleanData_survival$event <- with(cleanData_survival, ifelse(event == "normal", 0, 
+                                                      ifelse(event == "dementia", 1, NA)))
+
+TABLE <- as.data.frame(cleanData_survival)
+TABLE$time.event <- as.numeric(TABLE$time.event)
+TABLE <- drop_na(TABLE,event)
+	
+	coefficients<-as.data.frame(matrix(ncol= 10))
+ 
+	names(coefficients) <- c("AptName","Coeff", "se", "Pvalue", "Cox.zphPVal", "N", "ov.lik.ratio","logrank", "r2", "BIC" )
+ 
+	for (i in 9:ncol(TABLE)) {
+	print(colnames(TABLE)[i])
+  	protein <- TABLE[,c(i,1:8)]
+	j= i-8
+
+# test Cox model - if there is an error then put NoConverge into results
+  	testCox = try(coxph(Surv(protein$time.event, protein$event) ~ protein[,1] + protein$age_baseline + protein$sex + protein$SV1 + protein$SV2 + protein$SV3, data=protein), 
+  	              silent = T)
+  	
+  	if(class(testCox)[1]=="try-error"){
+  	  coefficients[j,1]<- paste(colnames(TABLE)[i])
+  	  coefficients[j,2:9] <- "NoConverge"
+  	} else {
+  	
+  	# if Cox model is not an error, run and get the coefficients
+  	model.cox<- coxph(Surv(protein$time.event, protein$event) ~ protein[,1] + protein$age_baseline + protein$sex + protein$SV1 + protein$SV2 + protein$SV3, data=protein)
+  	
+  	testkmz <- try(kmz<- cox.zph(model.cox, transform = "km"), silent = T)
+  	
+  	coefficients[j,1]<- paste(colnames(TABLE)[i])
+  	coefficients[j,2]<- summary(model.cox)$coefficients[1,1]
+  	coefficients[j,3]<- summary(model.cox)$coefficients[1,3]
+  	coefficients[j,4]<- summary(model.cox)$coefficients[1,5]
+  	coefficients[j,6]<- model.cox$n
+  	coefficients[j,7]<- summary(model.cox)$logtest[[1]]
+  	coefficients[j,8]<- summary(model.cox)$sctest[[1]]
+  	coefficients[j,9]<- summary(model.cox)$rsq[[1]] # nagelkerke r square
+  	coefficients[j,10] <- BIC(model.cox)
+  	
+  	# if kmz is not an error, get the Cox.zphPVal
+  	if(class(testkmz)[1] == "try-error"){
+  	coefficients[j,5]<- "solveError"
+  	} else {
+  	coefficients[j,5]<- kmz$table[1,3]
+  	}
+  	}
+  	}
+
+# Add protein names to the coefficients table
+    prot_list <- getAnalyteInfo(soma_data_replication_PASS) %>% dplyr::select(AptName, EntrezGeneSymbol)
+	coefficients$Protein <- prot_list$EntrezGeneSymbol[match(coefficients$AptName,prot_list$AptName)]
+	  
+# FDR adjusted P-values
+	coefficients$AdjP <- p.adjust(coefficients$Pvalue, method = "fdr")
+
+# Save output for meta-analysis
+    fwrite(coefficients,"replication_SomaScan_survival_SVs.txt", sep = "\t", quote = F, row.names = F, col.names = T) #full output
+```
+
+# Meta-analysis of the discovery and replication cohorts
+```{r}
+# load the discovery and replication results
+discovery_results <- fread("discovery_SomaScan_survival_SVs.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+replication_results <- fread("replication_SomaScan_survival_SVs.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE)  
+
+discovery_results <- discovery_results %>% dplyr::select(AptName,Coeff,se,Pvalue,N,logrank)
+replication_results <- replication_results %>% dplyr::select(AptName,Coeff,se,Pvalue,N,logrank)
+
+# keep only nominally significant from Discovery cohort (=replication)
+discovery_results <- semi_join(discovery_results, replication_results, by = "AptName")
+
+# merge summary statistics on AptName
+discovery_results$Study <- "TPD"
+replication_results$Study <- "OPDC"
+
+combined_data_dementia <- rbind(discovery_results, replication_results)
+combined_data_dementia$Study <- as.factor(combined_data_dementia$Study)
+combined_data_dementia <- combined_data_dementia %>% drop_na()
+
+# meta-analysis
+meta_results <- list()
+
+for(protein in unique(combined_data_dementia$AptName)) {
+  
+  # Subset data for the current protein
+  protein_data <- combined_data_dementia[combined_data_dementia$AptName == protein, ]
+  
+  # Run meta-analysis for the current protein
+  res <- rma(yi = protein_data$Coeff, sei = protein_data$se, method = "REML", slab = protein_data$Study, data = protein_data)
+  
+  # Store the result in the list
+  meta_results[[protein]] <- res
+}
+
+# Create a data frame to store the meta-analysis results for each protein
+meta_analysis_summary <- data.frame(
+  AptName = character(),
+  logHR = numeric(),
+  SE = numeric(),
+  CI_low = numeric(),
+  CI_high = numeric(),
+  pval = numeric(),
+  I2 = numeric(),
+  Tau2 = numeric(),
+  Q = numeric(),
+  Q_pval = numeric(),  
+  stringsAsFactors = FALSE
+)
+
+# Loop through the list and extract relevant information for each protein
+for(protein in names(meta_results)) {
+  
+  # Extract the result for the current protein
+  res <- meta_results[[protein]]
+  
+  # Store the summary results in the data frame
+  meta_analysis_summary <- rbind(meta_analysis_summary, data.frame(
+    AptName = protein,
+    logHR = res$b,  # Pooled logHR
+    SE = res$se,    # Standard error
+    CI_low = res$ci.lb,  # Lower bound of CI
+    CI_high = res$ci.ub, # Upper bound of CI
+    pval = res$pval, # p-value
+    I2 = res$I2,	           # Heterogeneity I²
+    Tau2 = res$tau2,	       # Between-study variance
+    Q = res$QE,	            # Q-statistic
+    Q_pval = res$QEp       # Q-test p-value	
+  ))
+}
+
+# Add gene symbols to the meta-analysis summary
+meta_analysis_summary$geneSymbol <- prot_list$EntrezGeneSymbol[match(meta_analysis_summary$AptName,prot_list$AptName)]
+
+# Adjust p-values for multiple testing using the Benjamini-Hochberg method
+meta_analysis_summary <- meta_analysis_summary %>%
+  mutate(Padj = p.adjust(pval, method = "BH"))
+
+# Save the meta-analysis summary results to a file
+write.table(meta_analysis_summary,"meta_pdd_cph.txt", sep = "\t", quote = F, row.names = F, col.names = T)
+
+```
+
+# Plot volcano plot for meta-analysis results
+```{r}
+# Create a volcano plot for the meta-analysis results
+pval_threshold <- 0.05
+
+meta_analysis_summary$color_group <- "grey"  # Default: non-significant
+meta_analysis_summary$color_group[meta_analysis_summary$Padj < pval_threshold] <- "red"
+meta_analysis_summary$color_group[meta_analysis_summary$Padj > pval_threshold & meta_analysis_summary$pval < pval_threshold] <- "grey"
+
+volcano_plot_survival_meta <- ggplot(meta_analysis_summary, aes(x = exp(logHR), y = -log10(Padj), label = geneSymbol, color = color_group)) +
+  geom_point(alpha = 0.8, size = 1.3) +
+  scale_color_manual(values = c("grey" = "grey", "red" = "red", "grey" = "grey")) +
+  geom_hline(yintercept = -log10(pval_threshold), linetype = "dashed", color = "grey") +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey") +
+  geom_text_repel(data = subset(meta_analysis_summary, Padj < pval_threshold), size = 3, max.overlaps = 15, color = "black", force = 2, force_pull = 0.5, min.segment.length = 0.2) +
+  labs(x = "Hazard Ratio", y = "-log10(FDR)") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none") + 
+  theme(aspect.ratio = 1,
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        legend.position = "none",  # Show legend
+        legend.title = element_blank())
+
+ggsave("volcano_plot_survival_meta.png", 
+       volcano_plot_survival_meta, 
+       width = 5, height = 5, dpi = 300)
+```
+
+# Corres plot of the meta-analysis results
+```{r}
+# Step 1: Find common row names
+common_rows <- intersect(discovery_results$AptName, replication_results$AptName)
+
+# Step 2: Subset both data frames to common rows
+df1_common <- discovery_results %>% filter(AptName %in% common_rows)
+df2_common <- replication_results %>% filter(AptName %in% common_rows)
+
+df1_common <- df1_common[order(df1_common$AptName), ]
+df2_common <- df2_common[order(df2_common$AptName), ]
+all(df1_common$AptName == df2_common$AptName)
+
+# Step 3: Merge data
+merged <- merge(df1_common, df2_common, by = "AptName", suffixes = c("_disc", "_repl"))
+names(merged)[1] <- "Protein"
+merged$Gene <- prot_list$EntrezGeneSymbol[match(merged$Protein,prot_list$AptName)]
+merged$FDR <- meta_analysis_summary$Padj[match(merged$Protein,meta_analysis_summary$AptName)]
+
+# Step 4: Identify significant genes
+merged <- merged %>% 
+   mutate(significant=ifelse(FDR < 0.05, "yes", "no"))
+
+# Step 5: Calculate z-score of the coefficients in discovery and replication cohorts
+merged$z_disc <- merged$Coeff_disc / merged$se_disc
+merged$z_repl <- merged$Coeff_repl / merged$se_repl
+
+# Step 6: Create the corres plot
+significant_proteins <- subset(merged, significant == "yes")
+
+corres_plot_z <- ggplot(merged, aes(x = z_disc, y = z_repl)) +
+ geom_point(aes(color = significant), size = 1.5, alpha = 0.8) +
+ geom_smooth(data = significant_proteins, method = "lm", color = "blue", se = TRUE, fill = "gray") +
+ scale_color_manual(values = c("gray", "red")) +
+ geom_point(data=subset(merged, significant=="yes"), color="red", size=1.3) + 
+ geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.2) +
+ geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.2) +
+ geom_text_repel(data = subset(merged, significant == "yes"), aes(label = Gene), size = 3, max.overlaps = 15, force_pull = 0.5, force = 2, min.segment.length = 0.2) +
+ labs(x = "z-score (Discovery)",
+ y = "z-score (Replication)") +
+ theme_minimal(base_size = 14) +
+ guides(color = "none") +
+ theme(aspect.ratio = 1) +
+ theme(legend.position = "none") +
+ theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+ panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+ggsave("corres_plot_z.png", 
+       corres_plot_z, 
+       width = 5, height = 5, dpi = 300)
+
+# Step 7: Calculate correlation between effect size of significant proteins in the meta-analysis
+cor(significant_proteins$z_disc, significant_proteins$z_repl)
+cor.test(significant_proteins$z_disc, significant_proteins$z_repl)
+```
+
+# Differential abundance analysis of the SomaScan data by APOE status in the discovery cohort
+```{r}
+# Step 1: Create a matrix of the expression data
+
+cleanData_discovery_exprs <- cleanData_discovery %>% dplyr::select(SampleId, starts_with("seq."))
+cleanData_discovery_exprs <- as.data.frame(cleanData_discovery_exprs) 
+rownames(cleanData_discovery_exprs) <- NULL
+
+cleanData_discovery_exprs_t <- setNames(data.frame(t(cleanData_discovery_exprs[ , - 1])), cleanData_discovery_exprs[ , 1])
+cleanData_discovery_exprs_t <- cleanData_discovery_exprs_t %>% dplyr::select(order(colnames(cleanData_discovery_exprs_t))) #order columns alphabetically
+
+write.table(cleanData_discovery_exprs_t,"discovery_exprsData.txt", sep = "\t", quote = F, row.names = T, col.names = T)
+
+exprsFile <- "discovery_exprsData.txt"
+exprs_discovery <- as.matrix(read.table(exprsFile, header=TRUE, sep="\t",
+                               row.names=1,
+                               as.is=TRUE))
+
+# Step 2: Create a table for the phenotype data
+pheno_discovery <- cleanData_discovery %>% dplyr::select(SampleId, age_baseline, sex, E4_allele, SV1, SV2, SV3)
+pheno_discovery$E4_allele <- with(pheno_discovery, ifelse(E4_allele == "e4-carrier", 2,1))   
+
+write.table(pheno_discovery,"discovery_pData.txt", sep = "\t", quote = F, row.names = F, col.names = T)
+
+pDataFile <- "discovery_pData.txt"
+pData_discovery <- read.table(pDataFile,
+                     row.names=1, header=TRUE, sep="\t")
+
+pData_discovery <- pData_discovery[colnames(exprs_discovery), , drop = FALSE] #reorder pData IDs to match exprs
+all(rownames(pData_discovery)==colnames(exprs_discovery)) #This must be true
+
+# Step 3: Assemble ExpressionSet object
+phenoData_discovery <- new("AnnotatedDataFrame", data = pData_discovery)
+
+dataSet_discovery <- ExpressionSet(assayData=exprs_discovery,
+                   phenoData=phenoData_discovery)
+
+dataSet_discovery <- dataSet_discovery[, !is.na(pData_discovery$E4_allele)]  # Remove rows with NA in E4_allele
+dataSet_discovery$E4_allele = factor(dataSet_discovery$E4_allele)
+
+# Step 4: Create a design matrix for the linear model
+design.cov <- model.matrix(~ 0 + E4_allele + sex + age_baseline + SV1 + SV2 + SV3, data=dataSet_discovery)
+head(design.cov)
+colnames(design.cov) <- c("E4_negative","E4_positive","sex","age","sv1","sv2","sv3")
+
+fit.cov <- lmFit(dataSet_discovery, design.cov)
+contrast_cov <- makeContrasts( 
+                     E4posvE4neg = E4_positive - E4_negative,
+                     levels = design.cov)
+fitC.cov <- contrasts.fit(fit.cov, contrast_cov)
+fitC.cov <- eBayes(fitC.cov) #calculate t-statistics
+
+saveRDS(fitC.cov,"discovery_Lm_APOE_cov.rds")
+
+results.cov_discovery <- decideTests(fitC.cov) #summarize results
+
+volcano_cov_tbl <- topTable(fitC.cov, sort = "none", n = Inf)
+volcano_cov_tbl <- cbind(geneSymbol = prot_list$EntrezGeneSymbol[ match(rownames(volcano_cov_tbl), prot_list$AptName) ],
+      volcano_cov_tbl)
+
+write.table(volcano_cov_tbl,"discovery_Lm_APOE_cov.txt", row.names = T, col.names = T, sep ="\t", quote = F)
+
+sig_proteins_lm_apoe <- volcano_cov_tbl %>% filter(P.Value<0.05)
+sig_proteins_lm_apoe <- row.names(sig_proteins_lm_apoe)
+
+write.table(sig_proteins_lm_apoe, "discovery_nominal_associations_apoe_lm.txt", quote = F, row.names = F, col.names = F)
+```
+
+# Differential protein abundance analysis of the SomaScan data by APOE status in the replication cohort
+```{r}
+nom_p_apoe_discovery <- fread("discovery_nominal_associations_apoe_lm.txt", header = F)
+
+# Step 1: Create a matrix of the expression data        
+cleanData_replication_exprs <- cleanData_replication %>% dplyr::select(SampleId, all_of(nom_p_apoe_discovery$V1))
+cleanData_replication_exprs <- as.data.frame(cleanData_replication_exprs)
+rownames(cleanData_replication_exprs) <- NULL
+
+cleanData_replication_exprs_t <- setNames(data.frame(t(cleanData_replication_exprs[ , - 1])), cleanData_replication_exprs[ , 1])
+cleanData_replication_exprs_t <- cleanData_replication_exprs_t %>% dplyr::select(order(colnames(cleanData_replication_exprs_t))) #order columns alphabetically              
+
+write.table(cleanData_replication_exprs_t,"replication_exprsData.txt", sep = "\t", quote = F, row.names = T, col.names = T)
+
+exprsFile <- "replication_exprsData.txt"
+exprs_replication <- as.matrix(read.table(exprsFile, header=TRUE, sep="\t",
+                               row.names=1,
+                               as.is=TRUE))
+
+# Step 2: Create a table for the phenotype data
+pheno_replication <- cleanData_replication %>% dplyr::select(SampleId, age_baseline, sex, E4_allele, SV1, SV2, SV3)
+pheno_replication$E4_allele <- with(pheno_replication, ifelse(E4_allele == "e4-carrier", 2,1))   
+
+pheno_replication <- pheno_replication %>% arrange(SampleId)
+pheno_replication <- pheno_replication %>% drop_na(E4_allele)
+
+write.table(pheno_replication,"replication_pData.txt", sep = "\t", quote = F, row.names = F, col.names = T)
+
+pDataFile <- "replication_pData.txt"
+pData_replication <- read.table(pDataFile,
+                     row.names=1, header=TRUE, sep="\t")
+
+common_samples <- intersect(colnames(exprs_replication), rownames(pData_replication))
+exprs_replication <- exprs_replication[, common_samples] #keep only common samples 
+pData_replication <- pData_replication[colnames(exprs_replication), , drop = FALSE] #reorder pData IDs to match exprs
+all(rownames(pData_replication)==colnames(exprs_replication)) #This must be true
+
+# Step 3: Assemble ExpressionSet object
+phenoData_replication <- new("AnnotatedDataFrame", data = pData_replication)
+
+dataSet_replication <- ExpressionSet(assayData=exprs_replication,
+                   phenoData=phenoData_replication)
+
+dataSet_replication <- dataSet_replication[, !is.na(pData_replication$E4_allele)]  # Remove rows with NA in E4_allele
+dataSet_replication$E4_allele = factor(dataSet_replication$E4_allele)
+
+# Step 4: Create a design matrix for the linear model
+design.cov <- model.matrix(~ 0 + E4_allele + sex + age_baseline + SV1 + SV2 + SV3, data=dataSet_replication)
+head(design.cov)
+colnames(design.cov) <- c("E4_negative","E4_positive","sex","age","sv1","sv2","sv3")
+
+fit.cov <- lmFit(dataSet_replication, design.cov)
+contrast_cov <- makeContrasts( 
+                     E4posvE4neg = E4_positive - E4_negative,
+                     levels = design.cov)
+fitC.cov <- contrasts.fit(fit.cov, contrast_cov)
+fitC.cov <- eBayes(fitC.cov) #calculate t-statistics
+
+saveRDS(fitC.cov,"replication_Lm_APOE_cov.rds")
+
+results.cov_replication <- decideTests(fitC.cov) #summarize results
+
+volcano_cov_tbl <- topTable(fitC.cov, sort = "none", n = Inf)
+volcano_cov_tbl <- cbind(geneSymbol = prot_list$EntrezGeneSymbol[ match(rownames(volcano_cov_tbl), prot_list$AptName) ],
+      volcano_cov_tbl)
+
+write.table(volcano_cov_tbl, "replication_Lm_APOE_cov.txt", row.names = T, col.names = T, sep = "\t", quote = F)
+
+sig_proteins_lm_apoe <- volcano_cov_tbl %>% filter(P.Value<0.05)
+sig_proteins_lm_apoe <- row.names(sig_proteins_lm_apoe)
+
+write.table(sig_proteins_lm_apoe, "replication_nominal_associations_apoe_lm.txt", quote = F, row.names = F, col.names = F)
+```
+
+# Meta-analysis of the discovery and replication cohorts for differential protein abundance analysis by APOE status
+```{r}
+# load the discovery and replication results
+discovery_results <- readRDS("discovery_Lm_APOE_cov.rds")
+replication_results <- readRDS("replication_Lm_APOE_cov.rds")
+
+# Discovery cohort
+## Calculate standard errors for the discovery study
+SE_discovery <- sqrt(discovery_results$s2.post) * discovery_results$stdev.unscaled
+## Create a data frame for the discovery study
+meta_data_discovery <- data.frame(
+  protein = rownames(discovery_results$coefficients), # Effect sizes
+  logFC = as.vector(discovery_results$coefficients),  # Standard errors
+  SE = as.vector(SE_discovery),
+  Study = "discovery"
+)
+
+# Replication cohort
+## Calculate standard errors for the replication study
+SE_replication <- sqrt(replication_results$s2.post) * replication_results$stdev.unscaled
+## Create a data frame for the replication study
+meta_data_replication <- data.frame(
+  protein = rownames(replication_results$coefficients),
+  logFC = as.vector(replication_results$coefficients),  
+  SE = as.vector(SE_replication),  
+  Study = "replication"
+)
+
+# Combine the discovery and replication data frames
+combined_meta_data_apoe <- rbind(meta_data_discovery, meta_data_replication)
+
+# Run meta-analysis for each protein
+meta_results_list <- list()
+
+for (protein in unique(combined_meta_data_apoe$protein)) {
+  protein_data <- combined_meta_data_apoe[combined_meta_data_apoe$protein == protein, ]
+
+  # Run meta-analysis for the current protein
+if (nrow(protein_data) > 1) {
+  meta_results <- rma(yi = logFC, sei = SE, 
+                    data = protein_data, 
+                    method = "REML")
+  meta_results_list[[protein]] <- meta_results
+} else {
+    meta_results_list[[protein]] <- NA  # Not enough data for meta-analysis
+  }
+}
+
+# Create a summary data frame for the meta-analysis results
+meta_summary_apoe <- data.frame()
+
+for (protein in names(meta_results_list)) {
+  meta_result <- meta_results_list[[protein]]
+  
+  # Ensure meta_result is a valid rma object before proceeding
+  if (inherits(meta_result, "rma")) {
+    summary_stats <- data.frame(
+      Protein = protein,
+      Estimate = coef(meta_result),  # Effect size (logFC)
+      SE = meta_result$se,           # Standard Error
+      CI_lower = meta_result$ci.lb,  # 95% CI Lower Bound
+      CI_upper = meta_result$ci.ub,  # 95% CI Upper Bound
+      Pvalue = meta_result$pval,     # P-value
+      I2 = meta_result$I2,           # Heterogeneity I²
+      Tau2 = meta_result$tau2,       # Between-study variance
+      Q = meta_result$QE,            # Q-statistic
+      Q_pval = meta_result$QEp       # Q-test p-value
+    )
+    
+    meta_summary_apoe <- rbind(meta_summary_apoe, summary_stats)
+  }
+}
+
+# Adjust P-values for multiple testing (FDR)
+meta_summary_apoe$FDR <- p.adjust(meta_summary_apoe$Pvalue, method = "BH")
+
+meta_summary_apoe$Gene <- prot_list$EntrezGeneSymbol[match(meta_summary_apoe$Protein,prot_list$AptName)]
+
+write.table(meta_summary_apoe, "meta_APOE_Lm.txt", row.names = F, col.names = T, sep = "\t", quote = F)
+
+```
+
+# Plot volcano plot for meta-analysis results of differential abundance analysis by APOE status
+```{r}
+# Create a volcano plot for the meta-analysis results of differential abundance analysis by APOE status
+# Define significance thresholds
+logFC_threshold <- 0.5
+pval_threshold <- 0.05
+
+meta_summary_apoe$color_group <- "grey"  # Default: non-significant
+meta_summary_apoe$color_group[meta_summary_apoe$FDR < pval_threshold & abs(meta_summary_apoe$Estimate) > logFC_threshold] <- "red"
+meta_summary_apoe$color_group[meta_summary_apoe$FDR < pval_threshold & abs(meta_summary_apoe$Estimate) <= logFC_threshold] <- "green4"
+
+
+volcano_plot_Lm_apoe_meta <- ggplot(meta_summary_apoe, aes(x = Estimate, y = -log10(FDR), label = Gene, color = color_group)) +
+  geom_point(alpha = 0.8, size = 1.5) +
+  scale_color_manual(values = c("grey" = "grey", "red" = "red", "green4" = "green4")) +
+  geom_hline(yintercept = -log10(pval_threshold), linetype = "dashed", color = "grey") +
+  geom_vline(xintercept = c(-logFC_threshold, logFC_threshold), linetype = "dashed", color = "grey") +
+  geom_text_repel(data = subset(meta_summary_apoe, FDR < pval_threshold), size = 4, max.overlaps = 30, color = "black") +
+  labs(x = "LogFC", y = "-log10(FDR)") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none") + 
+  theme(aspect.ratio = 1,
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        legend.position = "none",  # Show legend
+        legend.title = element_blank())
+
+ggsave("volcano_plot_Lm_apoe_meta.png", 
+       volcano_plot_Lm_apoe_meta, 
+       width = 5, height = 5, dpi = 300)
+```
+
+# Plot corres plot for meta-analysis results of differential abundance analysis by APOE status
+```{r}
+# Load the discovery and replication results
+discovery_results <- readRDS("discovery_Lm_APOE_cov.rds")
+replication_results <- readRDS("replication_Lm_APOE_cov.rds")
+
+# Step 1: Find common row names
+discovery_tbl <- topTable(discovery_results,sort="none",n=Inf)
+replication_tbl <- topTable(replication_results,sort="none",n=Inf)
+
+common_rows <- intersect(rownames(discovery_tbl), rownames(replication_tbl))
+
+# Step 2: Subset both data frames to common rows
+df1_common <- discovery_tbl[common_rows, , drop = FALSE]
+df2_common <- replication_tbl[common_rows, , drop = FALSE]
+
+# Step 3: Merge data
+df1_common$AptName <- rownames(df1_common)
+df2_common$AptName <- rownames(df2_common)
+
+df1_common <- df1_common[order(df1_common$AptName), ]
+df2_common <- df2_common[order(df2_common$AptName), ]
+all(df1_common$AptName == df2_common$AptName)
+
+merged <- merge(df1_common, df2_common, by = "AptName", suffixes = c("_disc", "_repl"))
+merged$FDR <- meta_summary_apoe$FDR[match(merged$AptName,meta_summary_apoe$Protein)]
+merged$Pvalue <- meta_summary_apoe$Pvalue[match(merged$AptName,meta_summary_apoe$Protein)]
+
+merged$Gene <- prot_list$EntrezGeneSymbol[match(merged$AptName,prot_list$AptName)]
+
+# Step 4: Identify significant genes
+merged <- merged %>% 
+   mutate(significant=ifelse(FDR < 0.05, "yes", 
+                            ifelse(Pvalue <0.05, "nominally", "no")))
+
+merged$significant <- factor(merged$significant, levels = c("no", "nominally", "yes"))
+
+significant_proteins <- subset(merged, significant == "yes")
+
+# Step 5: Create the corres plot
+corres_plot_apoe <- ggplot(merged, aes(x = logFC_disc, y = logFC_repl)) +
+ geom_point(aes(color = significant), size = 1.5, alpha = 0.8) +
+ geom_smooth(data = significant_proteins, method = "lm", color = "blue", se = TRUE, fill = "gray") +
+ geom_text_repel(data = subset(merged, significant == "yes"), aes(label = Gene), size = 4, max.overlaps = 30, force_pull = 0.5, min.segment.length = 0.2) +
+ scale_color_manual(values = c("gray", "grey", "red")) +
+ geom_point(data=subset(merged, significant=="yes"), color="red", size=1.3) +
+ geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.2) +
+ geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.2) +
+ labs(x = "logFC (Discovery)",
+ y = "logFC (Replication)") +
+ theme_minimal(base_size = 14) +
+ guides(color = "none") +
+ theme(aspect.ratio = 1) +
+ theme(legend.position = "none") +
+ theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+ panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+ggsave("corres_plot_apoe.png", 
+       corres_plot_apoe, 
+       width = 5, height = 5, dpi = 300)
+
+
+# Step 6: Correlation between effect size of significant proteins in the meta-analysis
+cor(significant_proteins$logFC_disc, significant_proteins$logFC_repl)
+cor.test(significant_proteins$logFC_disc, significant_proteins$logFC_repl)
+
+```
+
+# Plot corres plot of effect sizes in survival meta-analysis CPH vs Lm APOE meta-analysis, FDR<0.05
+```{r}
+# Load the meta-analysis results
+meta_cph_dementia <- fread("meta_pdd_cph.txt")
+meta_cph_dementia <- meta_cph_dementia %>% dplyr::select(AptName,logHR,SE,pval,Padj)
+
+meta_apoe4 <- fread("meta_APOE_Lm.txt")
+meta_apoe4 <- meta_apoe4 %>% dplyr::select(Protein,Estimate,SE,Pvalue,FDR)
+meta_apoe4 <- meta_apoe4 %>% dplyr::rename(AptName = Protein)
+                        
+# Step 1: Find common row names
+common_rows <- intersect(meta_cph_dementia$AptName, meta_apoe4$AptName)
+
+# Step 2: Subset both data frames to common rows
+df1_common <- meta_cph_dementia %>% filter(AptName %in% common_rows)
+df2_common <- meta_apoe4 %>% filter(AptName %in% common_rows)
+
+df1_common <- df1_common %>% dplyr::rename(Estimate = logHR,
+                                    Pvalue = pval,
+                                    FDR = Padj)
+
+# Merge data
+merged <- merge(df1_common, df2_common, by = "AptName", suffixes = c("_dementia", "_apoe"))
+merged$Gene <- prot_list$EntrezGeneSymbol[match(merged$AptName,prot_list$AptName)]
+
+# Identify significant genes
+merged <- merged %>% 
+   mutate(significant=ifelse(FDR_apoe < 0.05 & FDR_dementia < 0.05, "yes_both", 
+                            ifelse(FDR_apoe < 0.05 & FDR_dementia >= 0.05 & Pvalue_dementia > 0.05, "yes_apoe",
+                                ifelse(FDR_dementia < 0.05 & FDR_apoe >= 0.05, "yes_dementia", 
+                                       ifelse(FDR_apoe < 0.05 & Pvalue_dementia <0.05 & FDR_dementia > 0.05, "yes_apoe_nominal", "no")))))
+
+merged$z_dementia <- merged$Estimate_dementia / merged$SE_dementia
+merged$z_apoe <- merged$Estimate_apoe / merged$SE_apoe
+
+corres_plot_apoe_dementia_z <- ggplot(merged, aes(x = z_dementia, y = z_apoe, color = significant)) +
+ scale_color_manual(name='Legend',
+                    breaks=c('N.S.', 'FDR_dementia <0.05 & FDR_apoe <0.05', 'FDR_apoe <0.05', 'FDR_dementia <0.05', 'FDR_apoe <0.05 & Pval_dementia <0.05'),
+                    values = c("N.S." = "gray", "FDR_dementia <0.05 & FDR_apoe <0.05" = "red", "FDR_apoe <0.05" = "green3", "FDR_dementia <0.05" = "orange", "FDR_apoe <0.05 & Pval_dementia <0.05" = "blue3")) +
+ geom_point(data=subset(merged, significant=="yes_both"), color="red", size=1.3) +
+  geom_point(data=subset(merged, significant=="yes_apoe"), color="green3", size=1.3, alpha = 0.8) +
+  geom_point(data=subset(merged, significant=="yes_dementia"), color="orange", size=1.3, alpha = 0.8) +
+  geom_point(data=subset(merged, significant=="yes_apoe_nominal"), color="blue3", size=1.3, alpha = 0.8) +
+  geom_text_repel(data = subset(merged, significant == "yes_both"), aes(label = Gene), size = 4, max.overlaps = 20, force_pull = 0.2, force = 2, min.segment.length = 0.1, nudge_x = 0.5, color = "black") +
+  geom_text_repel(data = subset(merged, significant == "yes_apoe_nominal"), aes(label = Gene), size = 4, max.overlaps = 20, force_pull = 0.2, force = 2, min.segment.length = 0.1, nudge_x = 0.5, color = "black") +
+ geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.2) +
+ geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.2) +
+ labs(x = "z-score of effect size (survival)",
+ y = "z-score of effect size (APOE4)") +
+ theme_minimal(base_size = 14) +
+ theme(aspect.ratio = 1) +
+ theme(legend.position = "right") +
+ theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+ panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+ggsave("corres_plot_apoe_dementia_z.png", 
+       corres_plot_apoe_dementia_z, 
+       width = 5, height = 5, dpi = 300)
+```
+
+# pQTL analysis of TBCA and S100A13 in the discovery cohort
+```{r}
+# Upload principal components for the discovery cohort
+pca_discovery <- fread("discovery_PCA.eigenvec", header = FALSE)
+
+# Prepare the data for pQTL analysis
+cleanData_survival <- cleanData_discovery %>%
+  dplyr::select(SampleId, sex, age_baseline, rs429358, starts_with("seq."))
+  
+TABLE <- as.data.frame(cleanData_survival)
+    TABLE <- TABLE %>% drop_na(rs429358)
+
+protein_labels <- c("seq.12501.10" = "TBCA", "seq.7223.60" = "S100A13")
+
+TABLE_long <- TABLE %>% 
+  pivot_longer(cols = c(`seq.12501.10`, `seq.7223.60`), names_to = "Protein", values_to = "Value")
+
+TABLE_long$PC1 <- pca_discovery$V3[match(TABLE_long$SampleId, pca_discovery$V2)]
+TABLE_long$PC2 <- pca_discovery$V4[match(TABLE_long$SampleId, pca_discovery$V2)]
+
+TABLE_long <- TABLE_long %>%
+  mutate(rs429358 = as.numeric(as.character(rs429358)))
+TABLE_long$sex <- with(TABLE_long, ifelse(sex == "Male", 1,
+                                          ifelse(sex == "Female", 2, NA)))
+
+# Perform linear regression for each protein
+pqtl_results <- TABLE_long %>%
+  group_by(Protein) %>%
+  do(tidy(lm(Value ~ rs429358 + sex + age_baseline + PC1 + PC2, data = .))) 
+
+# Adjust p-values for multiple testing using the Benjamini-Hochberg method
+pqtl_results$p_adj <- p.adjust(pqtl_results$p.value, method = "fdr")
+
+# Violin plots
+pqtl_plot <- ggplot(TABLE_long, aes(x = rs429358, y = Value, fill = rs429358)) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black") +
+  geom_violin(scale = "width", trim = FALSE, color = "black") +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  facet_wrap(~ Protein, labeller = labeller(Protein = protein_labels), scales = "fixed") +
+  scale_fill_manual(values = c("0" = "#1b9e77", "1" = "#d95f02", "2" = "#7570b3")) +
+  labs(
+    x = "rs429358 genotype", 
+    y = "log2 RFU (z-transformed)"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid = element_blank(),
+    axis.line.x = element_line(),
+    axis.line.y = element_line(),
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_text(size = 9),
+    axis.text.y = element_text(size = 9),
+    legend.position = "none",
+    axis.title.y = element_text(angle = 90, vjust = 0.5, size = 10),
+    strip.text = element_text(face = "bold", size = 10)
+  )
+
+ggsave("plot_pqtl_tpd.png", 
+       pqtl_plot,
+       width = 4, height = 4, 
+       dpi = 300)
+```
+
+# Mediation analysis of TBCA and S100A13 levels on the association between APOE status and dementia in the discovery cohort
+```{r}
+# Prepare the data for mediation analysis
+cleanData_survival <- cleanData_discovery %>%
+  dplyr::select(SampleId, sex, age_baseline, E4_allele, time.event, event, SV1, SV2, SV3, "seq.12501.10", "seq.7223.60")
+  
+cleanData_survival$E4_allele <- with(cleanData_survival, ifelse(E4_allele == "e4-carrier", 2,1)) 
+
+TABLE <- as.data.frame(cleanData_survival)
+TABLE <- na.omit(TABLE[, c("time.event", "event", "E4_allele","seq.12501.10", "seq.7223.60", "age_baseline", "sex", "SV1", "SV2", "SV3")])
+
+TABLE$seq.12501.10 <- as.numeric(scale(TABLE$seq.12501.10))
+TABLE$seq.7223.60 <- as.numeric(scale(TABLE$seq.7223.60))
+TABLE$E4_allele <- as.numeric(TABLE$E4_allele)
+TABLE$sex  <- as.factor(TABLE$sex)
+TABLE$event <- ifelse(TABLE$event == "normal", 0, 1)
+
+#TBCA mediation analysis
+fit <- cmest(
+  data = TABLE,
+  model = "rb",          # regression-based approach
+  outcome = "time.event",
+  event = "event",
+  exposure = "E4_allele",
+  mediator = "seq.12501.10",
+  basec = c("age_baseline", "sex"),
+
+  yreg = "coxph",
+  mreg = list("linear"),
+  mval = list(0),
+  EMint = F,
+
+  inference = "bootstrap",
+  nboot = 1000
+)
+
+summary(fit)
+
+
+# S100A13 mediation analysis
+fit2 <- cmest(
+  data = TABLE,
+  model = "rb",          # regression-based approach
+  outcome = "time.event",
+  event = "event",
+  exposure = "E4_allele",
+  mediator = "seq.7223.60",
+  basec = c("age_baseline", "sex"),
+
+  yreg = "coxph",
+  mreg = list("linear"),
+  mval = list(0),
+  EMint = FALSE,
+
+  inference = "bootstrap",
+  nboot = 1000
+)
+
+summary(fit2)
+```     
+
+# Survival analysis of the SomaScan data adjusted for APOE status in the discovery cohort
+```{r}
+# Prepare the data for survival analysis
+cleanData_survival <- cleanData_discovery %>% 
+  dplyr::select(SampleId,event,time.event,sex,age_baseline,E4_allele,SV1,SV2,SV3,starts_with("seq."))
+
+cleanData_survival$event <- with(cleanData_survival, ifelse(event == "normal", 0, 
+                                                      ifelse(event == "dementia", 1, NA)))
+
+TABLE <- as.data.frame(cleanData_survival)
+
+TABLE <- TABLE[!is.na(TABLE$E4_allele), ]
+TABLE <- drop_na(TABLE,event)
+
+TABLE$E4_allele <- factor(TABLE$E4_allele)
+TABLE$time.event <- as.numeric(TABLE$time.event)
+TABLE$event <- as.numeric(TABLE$event)
+
+# Run Cox proportional hazards model for each protein
+	coefficients<-as.data.frame(matrix(ncol= 10))
+ 
+	names(coefficients) <- c("AptName","Coeff", "se", "Pvalue", "Cox.zphPVal", "N", "ov.lik.ratio","logrank", "r2", "BIC" )
+ 
+	for (i in 10:ncol(TABLE)) {
+	print(colnames(TABLE)[i])
+  	protein <- TABLE[,c(i,1:9)]
+	j= i-9
+
+    #Test Cox model - if there is an error then put NoConverge into results
+  	testCox = try(coxph(Surv(protein$time.event, protein$event) ~ protein[,1] + protein$E4_allele + protein$age_baseline + protein$sex + protein$SV1 + protein$SV2 + protein$SV3, data=protein), 
+  	              silent = T)
+  	
+  	if(class(testCox)[1]=="try-error"){
+  	  coefficients[j,1]<- paste(colnames(TABLE)[i])
+  	  coefficients[j,2:9] <- "NoConverge"
+  	} else {
+  	
+  	#If Cox model is not an error, run and get the coefficients
+  	model.cox<- coxph(Surv(protein$time.event, protein$event) ~ protein[,1] + protein$E4_allele + protein$age_baseline + protein$sex + protein$SV1 + protein$SV2 + protein$SV3, data=protein)
+  	
+  	testkmz <- try(kmz<- cox.zph(model.cox, transform = "km"), silent = T)
+  	
+  	coefficients[j,1]<- paste(colnames(TABLE)[i])
+  	coefficients[j,2]<- summary(model.cox)$coefficients[1,1]
+  	coefficients[j,3]<- summary(model.cox)$coefficients[1,3]
+  	coefficients[j,4]<- summary(model.cox)$coefficients[1,5]
+  	coefficients[j,6]<- model.cox$n
+  	coefficients[j,7]<- summary(model.cox)$logtest[[1]]
+  	coefficients[j,8]<- summary(model.cox)$sctest[[1]]
+  	coefficients[j,9]<- summary(model.cox)$rsq[[1]] # nagelkerke r square
+  	coefficients[j,10] <- BIC(model.cox)
+  	
+  	#If kmz is not an error, get the Cox.zphPVal
+  	if(class(testkmz)[1] == "try-error"){
+  	coefficients[j,5]<- "solveError"
+  	} else {
+  	coefficients[j,5]<- kmz$table[1,3]
+  	}
+  	}
+  	}
+    
+# Add gene symbols to the coefficients data frame
+    prot_list <- getAnalyteInfo(soma_data_discovery_PASS) %>% dplyr::select(AptName, EntrezGeneSymbol)
+	coefficients$Protein <- prot_list$EntrezGeneSymbol[match(coefficients$AptName,prot_list$AptName)]
+
+# Adjust p-values for multiple testing using the Benjamini-Hochberg method 
+    coefficients$AdjP <- p.adjust(coefficients$Pvalue, method = "fdr")
+
+# Save the coefficients data frame to a file
+    fwrite(coefficients,"discovery_SomaScan_cph_apoe4_all_SVs.txt", quote = F, row.names = F, col.names = T)
+
+    #nominally significant protein list for meta-analysis
+    sig_proteins_cph_dementia_apoe4 <- coefficients %>% filter(Pvalue<0.05)
+    sig_proteins_cph_dementia_apoe4 <- sig_proteins_cph_dementia_apoe4$AptName
+
+    write.table(sig_proteins_cph_dementia_apoe4, "discovery_nominal_associations_cph_apoe4_SVs.txt", quote = F, row.names = F, col.names = F)
+```
+
+# Survival analysis of the SomaScan data adjusted for APOE status in the replication cohort
+```{r}    
+# Import significant proteins from the discovery cohort
+apoe4_nom_p_cph_discovery <- fread("discovery_nominal_associations_cph_apoe4_SVs.txt", header = FALSE)
+
+# Select proteins significant in the discovery cohort for survival analysis in the replication cohort
+cleanData_survival <- cleanData_replication %>% 
+  dplyr::select(SampleId,event,time.event,sex,age_baseline,SV1,SV2,SV3,E4_allele,all_of(apoe4_nom_p_cph_discovery$V1))
+
+TABLE <- as.data.frame(cleanData_survival)
+
+TABLE$event <- with(TABLE, ifelse(event == "normal",0,
+                                  ifelse(event=="dementia",1,NA)))
+
+TABLE <- TABLE[!is.na(TABLE$E4_allele), ]
+TABLE <- drop_na(TABLE,event)
+
+TABLE$E4_allele <- factor(TABLE$E4_allele)
+TABLE$time.event <- as.numeric(TABLE$time.event)
+TABLE$event <- as.numeric(TABLE$event)
+
+# Model all proteins
+coefficients<-as.data.frame(matrix(ncol= 10))
+ 
+names(coefficients) <- c("AptName","Coeff", "se", "Pvalue", "Cox.zphPVal", "N", "ov.lik.ratio","logrank", "r2", "BIC" )
+ 
+	for (i in 10:ncol(TABLE)) {
+	print(colnames(TABLE)[i])
+  	protein <- TABLE[,c(i,1:9)]
+	j= i-9
+
+#Test Cox model - if there is an error then put NoConverge into results
+  	testCox = try(coxph(Surv(protein$time.event, protein$event) ~ protein[,1] + protein$E4_allele + protein$age_baseline + protein$sex + protein$SV1 + protein$SV2 + protein$SV3, data=protein), 
+  	              silent = T)
+  	
+  	if(class(testCox)[1]=="try-error"){
+  	  coefficients[j,1]<- paste(colnames(TABLE)[i])
+  	  coefficients[j,2:9] <- "NoConverge"
+  	} else {
+  	
+  	#If Cox model is not an error, run and get the coefficients
+  	model.cox<- coxph(Surv(protein$time.event, protein$event) ~ protein[,1] + protein$E4_allele + protein$age_baseline + protein$sex + protein$SV1 + protein$SV2 + protein$SV3, data=protein)
+  	
+  	testkmz <- try(kmz<- cox.zph(model.cox, transform = "km"), silent = T)
+  	
+  	coefficients[j,1]<- paste(colnames(TABLE)[i])
+  	coefficients[j,2]<- summary(model.cox)$coefficients[1,1]
+  	coefficients[j,3]<- summary(model.cox)$coefficients[1,3]
+  	coefficients[j,4]<- summary(model.cox)$coefficients[1,5]
+  	coefficients[j,6]<- model.cox$n
+  	coefficients[j,7]<- summary(model.cox)$logtest[[1]]
+  	coefficients[j,8]<- summary(model.cox)$sctest[[1]]
+  	coefficients[j,9]<- summary(model.cox)$rsq[[1]] # nagelkerke r square
+  	coefficients[j,10] <- BIC(model.cox)
+  	
+  	#If kmz is not an error, get the Cox.zphPVal
+  	if(class(testkmz)[1] == "try-error"){
+  	coefficients[j,5]<- "solveError"
+  	} else {
+  	coefficients[j,5]<- kmz$table[1,3]
+  	}
+  	}
+  	}
+
+# Add gene symbols to the coefficients data frame
+    prot_list <- getAnalyteInfo(soma_data_replication_PASS) %>% dplyr::select(AptName, EntrezGeneSymbol)
+	coefficients$Protein <- prot_list$EntrezGeneSymbol[match(coefficients$AptName,prot_list$AptName)]
+	
+# FDR adjusted P-values
+	coefficients$AdjP <- p.adjust(coefficients$Pvalue, method = "BH")
+
+#Save all output for tables and meta-analysis
+fwrite(coefficients,"replication_SomaScan_cph_apoe_all_SVs.txt", quote = F, row.names = F, col.names = T)
+```
+
+# Meta-analysis of the discovery and replication cohorts for survival analysis adjusted for APOE status
+```{r}
+# load the discovery and replication results
+discovery_results <- fread("discovery_SomaScan_cph_apoe4_all_SVs.txt") 
+replication_results <- fread("replication_SomaScan_cph_apoe_all_SVs.txt")  
+
+discovery_results <- discovery_results %>% dplyr::select(AptName,Coeff,se,Pvalue,N,logrank)
+replication_results <- replication_results %>% dplyr::select(AptName,Coeff,se,Pvalue,N,logrank)
+
+colnames(discovery_results) <- c("AptName", "logHR_TPD", "SE_TPD", "Pval_TPD","N_TPD","logrank_TPD")
+colnames(replication_results) <- c("AptName", "logHR_OPDC", "SE_OPDC", "Pval_OPDC", "N_OPDC","logrank_OPDC")
+
+# Merge on AptName (common proteins)
+meta_data_dementia <- merge(replication_results, discovery_results, by = "AptName", all = TRUE)
+
+meta_data_dementia <- meta_data_dementia %>% drop_na()
+
+meta_data_dementia_long <- reshape(meta_data_dementia, direction = "long",
+                          varying = list(c("logHR_OPDC", "logHR_TPD"), 
+                                         c("SE_OPDC", "SE_TPD")),
+                          v.names = c("logHR", "SE"),
+                          times = c("OPDC", "TPD"),
+                          timevar = "Study")
+
+meta_results <- list()
+
+for(protein in unique(meta_data_dementia_long$AptName)) {
+  
+  # Subset data for the current protein
+  protein_data <- meta_data_dementia_long[meta_data_dementia_long$AptName == protein, ]
+  
+  # Run meta-analysis for the current protein
+  res <- rma(yi = protein_data$logHR, sei = protein_data$SE, slab = protein_data$Study, data = protein_data)
+  
+  # Store the result in the list
+  meta_results[[protein]] <- res
+}
+
+# Create a data frame to store the meta-analysis results for each protein
+meta_analysis_summary <- data.frame(
+  AptName = character(),
+  logHR = numeric(),
+  SE = numeric(),
+  CI_low = numeric(),
+  CI_high = numeric(),
+  pval = numeric(),
+  I2 = numeric(),
+  Tau2 = numeric(),
+  Q = numeric(),
+  Q_pval = numeric(),  
+  stringsAsFactors = FALSE
+)
+
+# Loop through the list and extract relevant information for each protein
+for(protein in names(meta_results)) {
+  
+  # Extract the result for the current protein
+  res <- meta_results[[protein]]
+  
+  # Store the summary results in the data frame
+  meta_analysis_summary <- rbind(meta_analysis_summary, data.frame(
+    AptName = protein,
+    logHR = res$b,  # Pooled logHR
+    SE = res$se,    # Standard error
+    CI_low = res$ci.lb,  # Lower bound of CI
+    CI_high = res$ci.ub, # Upper bound of CI
+    pval = res$pval,     # p-value
+    I2 = res$I2,	           # Heterogeneity I²
+    Tau2 = res$tau2,	       # Between-study variance
+    Q = res$QE,	            # Q-statistic
+    Q_pval = res$QEp       # Q-test p-value	
+  ))
+}
+
+meta_analysis_summary$Protein <- prot_list$EntrezGeneSymbol[match(meta_analysis_summary$AptName,prot_list$AptName)]
+
+meta_analysis_summary <- meta_analysis_summary %>%
+  mutate(Padj = p.adjust(pval, method = "BH"))
+
+write.table(meta_analysis_summary,"meta_pdd_cph_apoe.txt", sep = "\t", quote = F, row.names = F, col.names = T)
+```    
+
+# Plot volcano plot for meta-analysis results of survival analysis adjusted for APOE status
+```{r}
+meta_analysis_summary_apoe <- fread("meta_pdd_cph_apoe.txt") 
+pval_threshold <- 0.05
+
+meta_analysis_summary_apoe$color_group <- "grey"  # Default: non-significant
+meta_analysis_summary_apoe$color_group[meta_analysis_summary_apoe$Padj < pval_threshold] <- "red"
+
+volcano_plot_survival_meta_apoe <- ggplot(meta_analysis_summary_apoe, aes(x = exp(logHR), y = -log10(Padj), label = Protein, color = color_group)) +
+  geom_point(alpha = 0.8, size = 1.3) +
+  scale_color_manual(values = c("grey" = "grey", "red" = "red")) +
+  geom_hline(yintercept = -log10(pval_threshold), linetype = "dashed", color = "grey") +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey") +
+  geom_text_repel(data = subset(meta_analysis_summary_apoe, Padj < pval_threshold), size = 3, max.overlaps = 15, color = "black", force = 2, force_pull = 0.5, min.segment.length = 0.2) +
+  labs(x = "Hazard Ratio", y = "-log10(FDR)") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none") + 
+  theme(aspect.ratio = 1,
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        legend.position = "none",  # Show legend
+        legend.title = element_blank())
+
+ggsave("volcano_plot_survival_apoe_meta.png", 
+       volcano_plot_survival_meta_apoe, 
+       width = 5, height = 5, dpi = 300)
+
+```
+
+# Plot corres plot for meta-analysis results of survival analysis adjusted for APOE status
+```{r}
+# Load the discovery and replication results
+discovery_results <- fread("discovery_SomaScan_cph_apoe4_all_SVs.txt") 
+replication_results <- fread("replication_SomaScan_cph_apoe_all_SVs.txt")  
+
+discovery_results <- discovery_results %>% dplyr::select(AptName,Coeff,se,Pvalue,N,logrank)
+replication_results <- replication_results %>% dplyr::select(AptName,Coeff,se,Pvalue,N,logrank)
+
+# Step 1: Find common row names
+common_rows <- intersect(discovery_results$AptName, replication_results$AptName)
+
+# Step 2: Subset both data frames to common rows
+df1_common <- discovery_results %>% filter(AptName %in% common_rows)
+df2_common <- replication_results %>% filter(AptName %in% common_rows)
+
+# Step 3: Merge data
+merged <- merge(df1_common, df2_common, by = "AptName", suffixes = c("_disc", "_repl"))
+merged$FDR <- meta_analysis_summary_apoe$Padj[match(merged$AptName,meta_analysis_summary_apoe$AptName)]
+merged$Gene <- prot_list$EntrezGeneSymbol[match(merged$AptName,prot_list$AptName)]
+
+# Step 4: Identify significant genes
+merged <- merged %>% 
+   mutate(significant=ifelse(FDR < 0.05, "yes", "no"))
+
+# Step 5: Calculate z-scores of effect sizes for discovery and replication cohorts
+merged$z_disc <- merged$Coeff_disc / merged$se_disc
+merged$z_repl <- merged$Coeff_repl / merged$se_repl
+
+# Step 6: Create the corres plot
+significant_proteins <- subset(merged, significant == "yes")
+
+corres_plot_survival_apoe_z <- ggplot(merged, aes(x = z_disc, y = z_repl)) +
+ geom_point(aes(color = significant), size = 1.5, alpha = 0.8) +
+ geom_smooth(data = significant_proteins, method = "lm", color = "blue", se = TRUE, fill = "gray") +
+  scale_color_manual(values = c("gray", "red")) +
+   geom_point(data=subset(merged, significant=="yes"), color="red", size=1.3) + 
+ geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.2) +
+ geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.2) +
+ geom_text_repel(data = subset(merged, significant == "yes"), aes(label = Gene), size = 3, max.overlaps = 15, force_pull = 0.5, min.segment.length = 0.2, force = 2) +
+ labs(x = "z-score (Discovery)",
+ y = "z-score (Replication)") +
+ theme_minimal(base_size = 14) +
+ guides(color = "none") +
+ theme(aspect.ratio = 1) +
+ theme(legend.position = "none") +
+ theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+ panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+ggsave("corres_plot_survival_apoe_z.png", 
+       corres_plot_survival_apoe_z , 
+       width = 5, height = 5, dpi = 300)
+```
+
+# Plot UpSet plot of the meta-analysis results of survival analysis with and without adjustment for APOE status
+```{r}
+meta_analysis_summary <- fread("meta_pdd_cph.txt")
+meta_analysis_summary_apoe <- fread("meta_pdd_cph_apoe.txt")
+
+no_apoe_significant <- meta_analysis_summary %>% filter(Padj < 0.05) #%>% dplyr::select(AptName)
+apoe_significant <- meta_analysis_summary_apoe %>% filter(Padj < 0.05) #%>% dplyr::select(AptName)
+
+upset_matrix <- list(
+  "Survival_basic" = no_apoe_significant$AptName,
+  "Survival_APOE_adjusted" = apoe_significant$AptName
+)
+  
+jpeg("upset_plot_survival_meta.png", res = 150, pointsize = 8)
+upset(
+  fromList(upset_matrix),
+  nsets = 2,  # Number of sets to display 
+  nintersects = 30,  # Number of intersections to display (adjust as needed)
+  order.by = "freq",  # Order by frequency of intersection
+  mainbar.y.label = "Number of Proteins",
+  point.size = 3,
+  line.size = 1,
+  mb.ratio = c(0.6, 0.4)
+)
+dev.off()
+```
+
+# REVIEW
+# Pathway enrichement analysis
+```{r}
+# Load the meta-analysis summary results for survival analysis adjusted for APOE status
+meta_analysis_summary_apoe <- fread("meta_pdd_cph_apoe.txt", header = T) 
+
+# Identify significant genes based on adjusted p-value threshold
+sig_genes <- meta_analysis_summary_apoe %>%
+  filter(Padj < 0.05) %>%
+  pull(Protein) %>%
+  unique()
+
+# GO annotations
+entrez_genes <- bitr(sig_genes, fromType = "SYMBOL",
+                     toType = "ENTREZID",
+                     OrgDb = org.Hs.eg.db)
+
+ego_all <- enrichGO(gene = entrez_genes$ENTREZID,
+                OrgDb = org.Hs.eg.db,
+                keyType = "ENTREZID",
+                ont = "ALL",     
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.1,
+                qvalueCutoff  = 0.2,
+                readable = TRUE
+                )
+
+# Simplify GO terms
+simplified_go_all <- simplify(ego_all,
+                           measure = "Wang",  
+                           by = "p.adjust",
+                           select_fun = min,
+                           cutoff = 0.7) 
+
+# KEGG annotations
+gene_list <- bitr(sig_genes, 
+                  fromType = "SYMBOL", 
+                  toType = "ENTREZID",
+                  OrgDb = org.Hs.eg.db)
+
+entrez_ids <- gene_list$ENTREZID
+
+kegg_results <- enrichKEGG(gene = entrez_ids,
+                           organism = 'hsa',   
+                           pAdjustMethod = "BH",
+                           pvalueCutoff = 0.05,
+                           qvalueCutoff = 0.2)
+
+
+kegg_results <- kegg_results@result
+
+# REACTOME
+reactome <- enrichPathway(
+  gene = entrez_genes$ENTREZID,
+  pvalueCutoff = 0.1,
+  qvalueCutoff = 0.2,
+  pAdjustMethod = "BH",
+  readable = TRUE
+)
+
+# Merge results for GO, KEGG, REACTOME
+GO <- simplified_go_all@result %>% dplyr::mutate(Category = paste("GO:",ONTOLOGY, sep=""))
+REACT <- reactome@result %>% dplyr::mutate(Category = "REACTOME")
+
+colsToKeep <- colnames(REACT)[which(colnames(REACT) %in% colnames(GO))]
+GO <- GO %>% dplyr::select(all_of(colsToKeep))
+REACT <- REACT %>% dplyr::select(all_of(colsToKeep))
+all <- rbind(GO,REACT)
+
+p_facet_simplified_all <- all %>% 
+  filter(p.adjust < 0.05, Count > 1) %>% 
+  mutate(log10_padj = -log10(p.adjust)) %>%
+  mutate(Description = str_to_sentence(Description)) %>%
+  ggplot(aes(x = log10_padj, 
+             y = reorder(Description, log10_padj),
+             fill = Category)) +
+  geom_col() +
+  facet_grid(Category ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_brewer(palette = "Set2") +
+  guides(fill = "none") +
+  labs(x = "-log10(P)", y = NULL) +
+  theme_bw(base_size = 12) 
+
+ggsave("pathway_enrich_apoe.png", 
+       p_facet_simplified_all, 
+       width = 8, height = 6, dpi = 300)
+
+```
+
+# StringDB
+```{r}
+# Load the meta-analysis summary results for survival analysis adjusted for APOE status
+meta_analysis_summary_apoe <- fread("meta_pdd_cph_apoe.txt", header = T) 
+
+# Identify significant genes based on adjusted p-value threshold
+sig_genes <- meta_analysis_summary_apoe %>%
+  filter(Padj < 0.05) %>%
+  pull(Protein) %>%
+  unique()
+
+# Initialize STRINGdb object with a score threshold of 400
+string_db <- STRINGdb$new(version="12.0", species=9606, score_threshold=400)
+
+# Map significant genes to STRING IDs
+mapped <- string_db$map(data.frame(Gene=sig_genes), "Gene", removeUnmappedRows=TRUE)
+
+# Map and plot network of protein-protein interactions (PPIs) for the mapped genes
+ppi_network <- string_db$get_interactions(mapped$STRING_id)
+
+postscript("string.ps", )
+string_db$plot_network(ppi_network)
+dev.off()
+
+# Map clusters of protein-protein interactions (PPIs) using the fast greedy algorithm
+options(timeout = 300)  
+ppi_clusters <- string_db$get_clusters(mapped$STRING_id, algorithm = "fastgreedy")
+
+# Annotate clusters
+Pro_clust=data.frame(matrix(NA, nrow = 4, ncol = 21))  
+for (i in 1:21) {
+  temp=ppi_clusters[[i]]
+  temp=unique(mapped$Gene[which(mapped$STRING_id%in%temp)])
+  length(temp)=4
+  Pro_clust[i]=temp
+} 
+
+clusters_list <- apply(Pro_clust, 2, function(x) na.omit(x))
+clusters_subset <- clusters_list[1:3]
+
+go_results <- lapply(clusters_subset, function(genes) {
+  # Map SYMBOL → ENTREZID
+  entrez <- bitr(genes, fromType="SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)$ENTREZID
+  # Skip empty clusters
+  if (length(entrez) == 0) return(NULL)
+  
+  enrichPathway(
+  gene = entrez,   # Entrez IDs
+  organism = "human",             
+  pvalueCutoff = 0.05,            # Set p-value cutoff
+  pAdjustMethod = "BH"
+  )
+})
+
+
+result=data.frame("ID"=NA,"Description"=NA,"GeneRatio"=NA,"BgRatio"=NA,"pvalue" =NA,"p.adjust"=NA,"qvalue"=NA,"geneID"=NA,"Count"=NA,"Redundant_with_term"=NA,"Category"=NA )
+
+for (i in c(1:3)) {
+  genes_full <- bitr(na.omit(Pro_clust[[i]]), fromType ="SYMBOL", toType =  "ENTREZID", OrgDb = org.Hs.eg.db) 
+  genes=na.omit(genes_full) 
+  genes=genes$ENTREZID  
+  ego <- enrichGO(gene = genes,
+                  keyType = "ENTREZID", 
+                  OrgDb = org.Hs.eg.db,
+                  ont = "BP",
+                  pAdjustMethod = "BH", 
+                  pvalueCutoff  =0.05, 
+                  qvalueCutoff  = 0.05,
+                  minGSSize     = 1,
+                  readable      = TRUE)
+  GO_data=data.frame(ego)
+  # skip if no enrichment
+  if (is.null(ego) || nrow(as.data.frame(ego)) == 0) next
+  GO_data=GO_data[order(GO_data$Count,decreasing = T),] 
+  
+  ego2 <- clusterProfiler::simplify(ego, cutoff=0.7, by="p.adjust", select_fun=min, measure = "Wang", semData = godata('org.Hs.eg.db', ont="BP")) 
+  GO_data2=data.frame(ego2)
+  # skip again if simplify removed everything
+  if (nrow(GO_data2) == 0) next
+  GO_data2=GO_data2[order(GO_data2$Count,decreasing = T),] 
+  
+  # Simplify annotations using GoSemSim
+  hsGO <- godata('org.Hs.eg.db', ont="BP") 
+  SemSim=mgoSim(GO_data2$ID, GO_data2$ID, semData=hsGO, measure="Wang", combine=NULL)
+  GO_data2$Redundant_with_term=NA
+  for (j in 1:nrow(GO_data2)) {
+    v=SemSim[j,][order(SemSim[j,],decreasing = T)]
+    name=rownames(as.data.frame(which(v>=0.25&v!=1))) 
+    name=GO_data2$Description[grep(paste0(name,collapse = "|"),GO_data2$ID)]
+    GO_data2$Redundant_with_term[j]=paste0(name,collapse = "|")
+  }
+  GO_data2$GeneRatio=gsub("/","_", GO_data2$GeneRatio)
+  GO_data2$BgRatio=gsub("/","_", GO_data2$BgRatio)
+  GO_data2$Category=i
+  
+  if (nrow(result) == 0) {
+    result <- GO_data2
+  } else {
+    missing_cols <- setdiff(colnames(result), colnames(GO_data2))
+    for (mc in missing_cols) GO_data2[[mc]] <- NA
+
+    missing_cols2 <- setdiff(colnames(GO_data2), colnames(result))
+    for (mc in missing_cols2) result[[mc]] <- NA
+
+    GO_data2 <- GO_data2[, colnames(result)]
+    result <- rbind(result, GO_data2)
+  }
+}
+result <- result[-1,]
+
+write.table(result, "string_clusters_go_annotation.txt", sep = "\t", quote = F, row.names = F, col.names = T)
+```

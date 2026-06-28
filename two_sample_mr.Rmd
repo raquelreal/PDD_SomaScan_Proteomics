@@ -1,0 +1,2231 @@
+---
+title: "Two-sample MR: Proteins to Dementia"
+author: "Rafaela Ravazio"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  clump_kb: null
+  clump_r2: null
+  outdir_base: null
+---
+
+## Overview
+
+This notebook provides a two-sample MR workflow across multiple proteins:
+
+1. Standardize exposure (protein GWAS) and outcome (dementia GWAS) summary statistics.
+2. Build per-protein cis instruments with p-value/F-stat filtering and LD clumping.
+3. Run MR with harmonization and sensitivity analyses.
+4. Optionally run Steiger directionality and MR-PRESSO sensitivity tests.
+5. Optionally run cis-window colocalization.
+6. Save per-protein outputs and combined summary tables.
+
+## Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(TwoSampleMR)
+  library(ggplot2)
+  library(coloc)
+  library(grid)
+})
+```
+
+## Configuration
+
+```{r config}
+# Returns TRUE when an Rmd YAML parameter is non-null and non-NA (i.e. was
+# explicitly passed at render time and should override the cfg default).
+has_param_override <- function(value) {
+  !is.null(value) && length(value) == 1 && !is.na(value)
+}
+
+# Converts a YAML parameter to a finite numeric value, stopping with a clear
+# error message if the conversion fails.
+get_numeric_param <- function(value, name) {
+  value_num <- suppressWarnings(as.numeric(value))
+  if (!is.finite(value_num)) {
+    stop("Parameter ", name, " must be a single finite numeric value.")
+  }
+  value_num
+}
+
+cfg <- list(
+  # Inputs — set these paths to match your local environment.
+  exposure_path = "path/to/exposure_gwas.tsv",
+  outcome_path  = "path/to/outcome_gwas.tsv",
+
+  # LD reference + PLINK
+  ld_bfile  = "path/to/ld_reference/1000G_EUR_chrpos",
+  plink_bin = "/path/to/plink",
+
+  # Instrument settings
+  clump_kb = 10000,
+  clump_r2 = 0.001,
+  clump_p = 1,
+  p_threshold = 5e-8,
+  f_threshold = 10,
+  cis_kb = 1000,
+
+  # Harmonization / MR
+  harmonise_action = 2, # see TwoSampleMR::harmonise_data
+  use_outcome_proxies = FALSE,
+  proxy_r2_min = 0.8,
+  proxy_window_kb = 1000,
+
+  # Labels
+  outcome_name = "Dementia meta-analysis",
+
+  # Steiger directionality (optional)
+  run_steiger = TRUE,
+  steiger_min_snps = 1,
+  steiger_exposure_N = 54219,  # TODO: set to your exposure GWAS N
+  steiger_outcome_N = 42140,   # TODO: set to your outcome GWAS N
+
+  # MR-PRESSO (optional)
+  run_mr_presso = TRUE,
+  mr_presso_min_snps = 4,
+  mr_presso_nb_distribution = 1000,
+  mr_presso_signif_threshold = 0.05,
+  mr_presso_outlier_test = TRUE,
+  mr_presso_distortion_test = TRUE,
+
+  # Colocalization
+  run_coloc = TRUE,
+  outcome_type_coloc = "cc", # "cc" or "quant"
+  outcome_N = NA_real_,
+  outcome_s = NA_real_,
+
+  # Output
+  outdir_base = "./results/two_sample_mr",
+
+  # Reproducibility
+  n_workers = 1,
+  seed = 42
+)
+
+if (exists("params")) {
+  if (has_param_override(params$clump_kb)) {
+    cfg$clump_kb <- get_numeric_param(params$clump_kb, "clump_kb")
+  }
+  if (has_param_override(params$clump_r2)) {
+    cfg$clump_r2 <- get_numeric_param(params$clump_r2, "clump_r2")
+  }
+  if (has_param_override(params$outdir_base)) {
+    cfg$outdir_base <- as.character(params$outdir_base)
+  }
+}
+
+# gene_pos values are hg19/GRCh37 coordinates used to define the ±cis_kb window.
+protein_settings <- data.table(
+  protein = c(
+    "HNF4A", "COL28A1", "ASPRV1", "COL6A3", "CD59", "CRABP2", "ARHGAP1", "TBCA", "PPM1A", "PPP2R3A", "RAB14", "DKK3",
+    "ERP29", "GPNMB", "RTN4R", "CTSD", "CLSTN3", "PLBD1", "DEFB1", "POSTN", "ST8SIA3", "S100A13", "GLTPD2", "CDH7", "PATE4",
+    "CMPK1", "MFAP2", "GAA", "DUT",
+    "RIC3", "PVRL3", "LANCL1", "MMP7", "BMP10", "PEX5", "NEGR1", "MAN1B1", "KIAA1024", "IFNGR2", "CTRL", "RBBP6"
+  ),
+  gene_chr = c(
+    20, 7, 2, 2, 11, 1, 11, 5, 14, 3, 9, 11,
+    12, 7, 22, 11, 12, 12, 8, 13, 18, 1, 17, 18, 11,
+    1, 1, 17, 15,
+    11, 3, 2, 11, 2, 12, 1, 9, 15, 21, 16, 16
+  ),
+  gene_pos = c(
+    43063236, 7575504, 70314507, 238322807, 33758025, 156675576, 46722169, 77072163, 60765805, 135866736, 123964147, 12030883,
+    112461253, 23314727, 20255841, 1785157, 7311541, 14720817, 6735458, 38172905, 55036162, 153606837, 4693884, 63557573, 125709967,
+    47844511, 17308078, 78093680, 48635570,
+    8190572, 110913017, 211341483, 102401478, 69098529, 7371170, 72748222, 140003635, 79764646, 34809823, 67965765, 24584184
+  )
+)
+
+dir.create(cfg$outdir_base, showWarnings = FALSE, recursive = TRUE)
+set.seed(cfg$seed)
+
+knitr::kable(protein_settings, caption = "Proteins tested")
+```
+
+## Runtime Checks
+
+```{r runtime_checks}
+required_files <- c(
+  cfg$exposure_path,
+  cfg$outcome_path,
+  paste0(cfg$ld_bfile, ".bed"),
+  paste0(cfg$ld_bfile, ".bim"),
+  paste0(cfg$ld_bfile, ".fam")
+)
+
+missing_files <- required_files[!file.exists(required_files)]
+if (length(missing_files) > 0) {
+  stop("Missing required input files:\n", paste(missing_files, collapse = "\n"))
+}
+
+if (!file.exists(cfg$plink_bin)) {
+  stop("PLINK binary not found at: ", cfg$plink_bin)
+}
+
+if (!exists("clump_data", envir = asNamespace("TwoSampleMR"), inherits = FALSE)) {
+  stop(
+    "TwoSampleMR::clump_data() is not available in this installation.\n",
+    "Install or update TwoSampleMR to a version that supports local clumping."
+  )
+}
+
+clump_formals <- names(formals(get("clump_data", envir = asNamespace("TwoSampleMR"))))
+needed_clump_args <- c("clump_kb", "clump_r2", "clump_p1", "bfile", "plink_bin")
+missing_clump_args <- setdiff(needed_clump_args, clump_formals)
+if (length(missing_clump_args) > 0) {
+  stop(
+    "Installed TwoSampleMR::clump_data() does not support required local clumping args: ",
+    paste(missing_clump_args, collapse = ", "),
+    ".\nInstall or update TwoSampleMR to a version with local PLINK support."
+  )
+}
+
+cfg$n_workers <- suppressWarnings(as.integer(cfg$n_workers[[1]]))
+if (!is.finite(cfg$n_workers) || cfg$n_workers < 1L) {
+  stop("cfg$n_workers must be a single integer >= 1.")
+}
+
+plink_help_ld <- tryCatch(
+  system2(cfg$plink_bin, args = c("--help", "ld-snp-list"), stdout = TRUE, stderr = TRUE),
+  error = function(e) character()
+)
+cfg$plink_has_ld_snp_list <- any(grepl("--ld-snp-list", plink_help_ld, fixed = TRUE))
+
+if (cfg$n_workers > 1L && .Platform$OS.type != "unix") {
+  warning("cfg$n_workers > 1 requested on a non-Unix platform; falling back to serial execution.")
+}
+
+if (isTRUE(cfg$run_mr_presso) && !requireNamespace("MRPRESSO", quietly = TRUE)) {
+  stop(
+    "MRPRESSO package is required when cfg$run_mr_presso = TRUE.\n",
+    "Install with install.packages('MRPRESSO') or set cfg$run_mr_presso = FALSE."
+  )
+}
+```
+
+## Helper Functions
+
+```{r helpers}
+# Stops with a clear message if any required columns are absent from a data frame.
+must_have <- function(df, cols, nm = "data.frame") {
+  miss <- setdiff(cols, names(df))
+  if (length(miss)) stop(nm, " missing required columns: ", paste(miss, collapse = ", "))
+}
+
+# Reads a PLINK .bim file and normalises chromosome codes (X→23, Y→24, MT→25).
+read_bim <- function(bfile) {
+  bim_path <- paste0(bfile, ".bim")
+  bim <- fread(bim_path, header = FALSE)
+  setnames(bim, c("CHR", "SNP", "CM", "POS", "A1", "A2"))
+
+  bim[, CHR := as.character(CHR)]
+  bim[CHR %in% c("X", "x"), CHR := "23"]
+  bim[CHR %in% c("Y", "y"), CHR := "24"]
+  bim[CHR %in% c("MT", "Mt", "mt", "M", "m"), CHR := "25"]
+  bim[, CHR := as.integer(CHR)]
+  bim
+}
+
+# PLINK clumping fails silently when SNP IDs are duplicated in the .bim file.
+# This function detects duplicates and writes a deduplicated copy of the bim,
+# appending "_dup2", "_dup3", etc. to repeated IDs. The .bed/.fam are reused as-is.
+ensure_unique_ld_bfile <- function(bfile, bim, outdir_base, force = FALSE) {
+  dup_ids <- bim$SNP[duplicated(bim$SNP)]
+  if (length(dup_ids) == 0) {
+    message("LD reference has unique SNP IDs.")
+    return(list(bfile = bfile, bim = bim, dedup = FALSE))
+  }
+
+  message("LD reference has duplicate SNP IDs; creating deduplicated copy.")
+
+  dedup_dir <- file.path(outdir_base, "ld_ref_dedup")
+  dir.create(dedup_dir, showWarnings = FALSE, recursive = TRUE)
+  out_prefix <- file.path(dedup_dir, paste0(basename(bfile), "_uniqid"))
+
+  if (!force &&
+      file.exists(paste0(out_prefix, ".bed")) &&
+      file.exists(paste0(out_prefix, ".bim")) &&
+      file.exists(paste0(out_prefix, ".fam"))) {
+    return(list(bfile = out_prefix, bim = read_bim(out_prefix), dedup = TRUE))
+  }
+
+  bim2 <- data.table::as.data.table(bim)
+  bim2[, dup_rank := seq_len(.N), by = SNP]
+  bim2[dup_rank > 1, SNP := paste0(SNP, "_dup", dup_rank)]
+
+  data.table::fwrite(bim2[, .(CHR, SNP, CM, POS, A1, A2)],
+                     paste0(out_prefix, ".bim"),
+                     sep = "\t", col.names = FALSE)
+  file.copy(paste0(bfile, ".bed"), paste0(out_prefix, ".bed"), overwrite = TRUE)
+  file.copy(paste0(bfile, ".fam"), paste0(out_prefix, ".fam"), overwrite = TRUE)
+
+  bim2[, dup_rank := NULL]
+  list(bfile = out_prefix, bim = bim2, dedup = TRUE)
+}
+
+# Parses variant IDs in CHR:POS or CHR:POS:REF:ALT format (colons or underscores)
+# into separate CHR, POS, REF, ALT columns. Used to recover coordinates from
+# outcome GWAS files that only provide a variant ID column.
+parse_marker <- function(x) {
+  x <- as.character(x)
+  x2 <- gsub("_", ":", x, fixed = TRUE)
+  parts <- tstrsplit(x2, ":", fixed = TRUE)
+  out <- data.table(MarkerName = x)
+
+  if (length(parts) >= 2) {
+    chr_raw <- gsub("^chr", "", parts[[1]], ignore.case = TRUE)
+    chr_raw[chr_raw %in% c("X", "x")] <- "23"
+    chr_raw[chr_raw %in% c("Y", "y")] <- "24"
+    chr_raw[chr_raw %in% c("MT", "Mt", "mt", "M", "m")] <- "25"
+    out[, CHR := suppressWarnings(as.integer(chr_raw))]
+    out[, POS := suppressWarnings(as.integer(parts[[2]]))]
+  }
+  if (length(parts) >= 4) {
+    out[, REF := toupper(parts[[3]])]
+    out[, ALT := toupper(parts[[4]])]
+  }
+  out
+}
+
+# Returns TRUE for A/T or C/G allele pairs, which are palindromic (strand-ambiguous).
+is_palindromic_pair <- function(a1, a2) {
+  a1 <- toupper(as.character(a1))
+  a2 <- toupper(as.character(a2))
+
+  valid <- !is.na(a1) & !is.na(a2)
+  out <- rep(FALSE, length(a1))
+  out[valid] <- paste0(a1[valid], a2[valid]) %in% c("AT", "TA", "CG", "GC")
+  out
+}
+
+# Removes all palindromic SNPs from harmonised data regardless of EAF.
+# TwoSampleMR action=2 keeps palindromic SNPs with unambiguous EAF; we drop
+# all of them here for conservative analysis (equivalent to action=3).
+drop_palindromic_harmonised <- function(dat) {
+  keep_attr <- attributes(dat)
+
+  if (!all(c("effect_allele.exposure", "other_allele.exposure") %in% names(dat))) {
+    return(dat)
+  }
+
+  pal <- is_palindromic_pair(dat$effect_allele.exposure, dat$other_allele.exposure)
+  removed <- dat[pal, , drop = FALSE]
+  kept <- dat[!pal, , drop = FALSE]
+
+  if (!is.null(keep_attr$audit)) attr(kept, "audit") <- keep_attr$audit
+  attr(kept, "palindromic_removed") <- removed
+  kept
+}
+
+# Returns the first finite numeric value from a vector, or NA if none exist.
+first_numeric_or_na <- function(x) {
+  x_num <- suppressWarnings(as.numeric(x))
+  x_num <- x_num[is.finite(x_num)]
+  if (length(x_num) == 0) return(NA_real_)
+  x_num[[1]]
+}
+
+# Normalises a raw exposure GWAS data frame to a common internal format with
+# columns: CHR, POS, ID, effect_allele, other_allele, eaf, beta, se,
+# neglog10p, pval, samplesize, PROTEIN, snp, protein_key.
+# Handles two input layouts: "legacy" (CHR/POS/ALTFREQ/LOG10P/PROTEIN columns)
+# and "new" (VARIANT_ID/chromosome/position/Allele1/Allele2/Effect/StdErr columns).
+# Rows with missing coordinates, non-ACGT alleles, or invalid beta/se are dropped.
+standardise_exposure <- function(exp_raw) {
+  dt <- as.data.table(exp_raw)
+  cn <- names(dt)
+
+  is_legacy <- all(c("CHR", "POS", "ID", "REF", "ALT", "ALTFREQ", "N", "BETA", "SE", "LOG10P", "PROTEIN") %in% cn)
+  logp_col <- intersect(c("log(P)", "logp", "logP", "LOGP"), cn)
+  prot_col <- intersect(c("protein", "PROTEIN", "protein_id"), cn)
+  is_new <- all(c("VARIANT_ID", "chromosome", "position", "Allele1", "Allele2", "Effect", "StdErr") %in% cn) &&
+    length(logp_col) == 1 && length(prot_col) == 1
+
+  if (!is_legacy && !is_new) {
+    stop(
+      "Exposure format not recognised. Expected either legacy or new format."
+    )
+  }
+
+  # Detects whether the log-p column stores -log10(p), ln(p), or log10(p) by
+  # correlating each candidate with z-score-derived -log10(p) values, then
+  # returns the best-fitting version as -log10(p).
+  infer_neglog10p <- function(beta, se, logp_raw) {
+    ok <- is.finite(beta) & is.finite(se) & se > 0 & is.finite(logp_raw)
+
+    if (sum(ok) < 1000) {
+      med <- median(logp_raw[ok], na.rm = TRUE)
+      if (is.finite(med) && med < 0) return(-logp_raw)
+      return(logp_raw)
+    }
+
+    idx <- which(ok)
+    if (length(idx) > 200000) idx <- idx[seq_len(200000)]
+
+    z <- beta[idx] / se[idx]
+    pz <- 2 * pnorm(-abs(z))
+    target <- -log10(pz)
+
+    c1 <- -logp_raw[idx]
+    c2 <- -logp_raw[idx] / log(10)
+    c3 <- logp_raw[idx]
+
+    cor1 <- suppressWarnings(cor(c1, target, use = "complete.obs"))
+    cor2 <- suppressWarnings(cor(c2, target, use = "complete.obs"))
+    cor3 <- suppressWarnings(cor(c3, target, use = "complete.obs"))
+
+    best <- which.max(abs(c(cor1, cor2, cor3)))
+    if (best == 1) return(-logp_raw)
+    if (best == 2) return(-logp_raw / log(10))
+    logp_raw
+  }
+
+  if (is_legacy) {
+    out <- dt[, .(
+      CHR = as.integer(gsub("^chr", "", as.character(CHR), ignore.case = TRUE)),
+      POS = as.integer(POS),
+      ID = as.character(ID),
+      effect_allele = toupper(as.character(ALT)),
+      other_allele = toupper(as.character(REF)),
+      eaf = suppressWarnings(as.numeric(ALTFREQ)),
+      beta = suppressWarnings(as.numeric(BETA)),
+      se = suppressWarnings(as.numeric(SE)),
+      neglog10p = suppressWarnings(as.numeric(LOG10P)),
+      samplesize = suppressWarnings(as.numeric(N)),
+      PROTEIN = as.character(PROTEIN)
+    )]
+  } else {
+    lp <- logp_col[[1]]
+    pr <- prot_col[[1]]
+
+    out <- dt[, .(
+      CHR = as.integer(gsub("^chr", "", as.character(chromosome), ignore.case = TRUE)),
+      POS = as.integer(position),
+      ID = as.character(VARIANT_ID),
+      effect_allele = toupper(as.character(Allele1)),
+      other_allele = toupper(as.character(Allele2)),
+      eaf = NA_real_,
+      beta = suppressWarnings(as.numeric(Effect)),
+      se = suppressWarnings(as.numeric(StdErr)),
+      logp_raw = suppressWarnings(as.numeric(get(lp))),
+      samplesize = NA_real_,
+      PROTEIN = as.character(get(pr))
+    )]
+
+    out[, neglog10p := infer_neglog10p(beta, se, logp_raw)]
+    out[, logp_raw := NULL]
+  }
+
+  out[, snp := paste0(CHR, ":", POS)]
+  is_acgt <- function(x) !is.na(x) & grepl("^[ACGT]$", x)
+
+  out <- out[
+    is.finite(CHR) & is.finite(POS) &
+      is.finite(beta) & is.finite(se) & se > 0 &
+      is.finite(neglog10p) &
+      is_acgt(effect_allele) & is_acgt(other_allele)
+  ]
+
+  out[, pval := 10^(-pmin(neglog10p, 300))]
+  out[, protein_key := toupper(PROTEIN)]
+  out
+}
+
+# ---- Instrument diagnostics ----
+# These four functions track how many SNPs survive each filter step per protein.
+# instrument_diag_init()     creates a one-row data.table of NA counters.
+# instrument_diag_set()      updates individual counters in-place.
+# instrument_diag_complete() marks the run as ok or failed and returns a copy.
+# instrument_diag_write()    combines all proteins, adds boolean survive_* flags,
+#                            and writes instrument_filter_counts_all_proteins.tsv.
+instrument_diag_init <- function(protein, gene_chr, gene_pos, cfg) {
+  data.table(
+    protein = protein,
+    gene_chr = gene_chr,
+    gene_pos = gene_pos,
+    cis_start = gene_pos - cfg$cis_kb * 1000,
+    cis_end   = gene_pos + cfg$cis_kb * 1000,
+
+    n_exp_protein_total = NA_integer_,
+    n_exp_chr_total = NA_integer_,
+    n_exp_cis_total = NA_integer_,
+    n_exp_after_p = NA_integer_,
+    n_exp_with_eaf = NA_integer_,
+
+    n_exp_after_f = NA_integer_,
+    n_exp_unique_snp = NA_integer_,
+    n_exp_in_ld = NA_integer_,
+    n_exp_missing_ld = NA_integer_,
+    n_exp_to_clump = NA_integer_,
+    n_exp_after_clump = NA_integer_,
+    n_outcome_overlap = NA_integer_,
+    n_outcome_with_eaf = NA_integer_,
+
+    n_after_format_overlap = NA_integer_,
+    n_after_harmonise = NA_integer_,
+    n_palindromic_removed = NA_integer_,
+    n_mr_keep = NA_integer_,
+
+    status = "started",
+    fail_step = NA_character_,
+    fail_message = NA_character_
+  )
+}
+
+instrument_diag_set <- function(diag, ...) {
+  vals <- list(...)
+  for (nm in names(vals)) {
+    data.table::set(diag, j = nm, value = vals[[nm]])
+  }
+  diag
+}
+
+instrument_diag_complete <- function(diag,
+                                     status_value = "ok",
+                                     fail_step_value = NA_character_,
+                                     fail_message_value = NA_character_) {
+  data.table::set(diag, j = "status", value = status_value)
+  data.table::set(diag, j = "fail_step", value = fail_step_value)
+  data.table::set(diag, j = "fail_message", value = fail_message_value)
+  data.table::copy(diag)
+}
+
+instrument_diag_write <- function(diag_rows,
+                                  outdir_base,
+                                  file = "instrument_filter_counts_all_proteins.tsv") {
+  if (length(diag_rows) == 0L) {
+    message("No instrument diagnostics collected.")
+    return(invisible(NULL))
+  }
+
+  dt <- rbindlist(diag_rows, fill = TRUE, use.names = TRUE)
+
+  dt[, survive_p   := !is.na(n_exp_after_p)   & n_exp_after_p   > 0L]
+
+  dt[, survive_f   := !is.na(n_exp_after_f)   & n_exp_after_f   > 0L]
+  dt[, survive_ld := !is.na(n_exp_in_ld) & n_exp_in_ld > 0L]
+  dt[, survive_clump := !is.na(n_exp_after_clump) & n_exp_after_clump > 0L]
+  dt[, survive_outcome_overlap := !is.na(n_outcome_overlap) & n_outcome_overlap > 0L]
+  dt[, survive_harmonise := !is.na(n_after_harmonise) & n_after_harmonise > 0L]
+  dt[, survive_mr_keep := !is.na(n_mr_keep) & n_mr_keep > 0L]
+
+  safe_write_tsv(dt, file.path(outdir_base, file))
+
+  invisible(dt)
+}
+
+# Keeps one row per SNP ID, retaining the row with the lowest p-value when
+# a pval column is present (otherwise the first row encountered).
+deduplicate_by_snp <- function(dt) {
+  dt <- copy(as.data.table(dt))
+  if (!("snp" %in% names(dt))) return(dt)
+
+  if ("pval" %in% names(dt)) {
+    setorder(dt, snp, pval)
+  } else {
+    setorder(dt, snp)
+  }
+  dt[!duplicated(snp)]
+}
+
+# Subsets the global exposure table to SNPs for one protein within the cis window.
+subset_exposure_region <- function(exp_dt, protein_key_value, gene_chr, cis_start, cis_end) {
+  copy(
+    exp_dt[
+      protein_key == protein_key_value &
+        CHR == gene_chr &
+        POS >= cis_start & POS <= cis_end
+    ]
+  )
+}
+
+# Subsets the global outcome table to SNPs within the cis window (used for coloc).
+subset_outcome_region <- function(out_dt, gene_chr, cis_start, cis_end) {
+  copy(
+    out_dt[
+      CHR == gene_chr &
+        POS >= cis_start & POS <= cis_end
+    ]
+  )
+}
+
+# Returns TRUE only for biallelic SNPs where both alleles are single ACGT bases.
+# Filters out indels and multi-character alleles, which cannot be harmonised.
+is_acgt_snp <- function(a1, a2) {
+  a1 <- toupper(as.character(a1))
+  a2 <- toupper(as.character(a2))
+  nchar(a1) == 1 & nchar(a2) == 1 & a1 %in% c("A", "C", "G", "T") & a2 %in% c("A", "C", "G", "T")
+}
+
+# Normalises a raw outcome GWAS to the same internal format used by the exposure.
+# Uses fuzzy column-name matching to handle diverse GWAS file layouts.
+# OR and HR columns are log-transformed to beta scale; SE can be derived from CIs.
+# Prints the detected column mapping so you can verify the right columns were used.
+standardise_outcome <- function(out_raw, verbose = TRUE) {
+  dt <- as.data.table(out_raw)
+  cn <- names(dt)
+
+  norm <- function(x) gsub("[^a-z0-9]", "", tolower(x))
+  cn_norm <- norm(cn)
+  pick_col <- function(cands) {
+    idx <- match(norm(cands), cn_norm, nomatch = 0)
+    if (any(idx > 0)) return(cn[idx[idx > 0][1]])
+    NULL
+  }
+
+  chr_col <- pick_col(c("chr", "chromosome", "chrom", "chrid"))
+  pos_col <- pick_col(c("pos", "position", "basepairlocation", "basepair", "bp", "basepairposition", "base_pair_location"))
+  snp_col <- pick_col(c("snp", "variantid", "variant_id", "markername", "marker_name", "rsid", "rs_id"))
+
+  ea_col <- pick_col(c("effectallele", "effect_allele", "allele1", "a1", "alt", "alt_allele"))
+  oa_col <- pick_col(c("otherallele", "other_allele", "noneffect_allele", "noneffectallele", "allele2", "a2", "ref", "ref_allele"))
+
+  beta_col <- pick_col(c("beta", "effect", "estimate", "logodds", "logor", "log_or", "loghr", "log_hr"))
+  se_col <- pick_col(c("se", "standarderror", "stderr", "stderror", "sebeta", "se_beta", "stderrbeta"))
+  pval_col <- pick_col(c("pval", "pvalue", "p_value", "p-value", "p"))
+  eaf_col <- pick_col(c("eaf", "effectallelefrequency", "effect_allele_frequency", "freq1", "allele1freq", "allele1frequency"))
+  n_col <- pick_col(c(
+    "n", "samplesize", "sample_size", "samplesizetotal", "totalsamplesize", "total_sample_size",
+    "totaln", "n_total", "n_total_samples", "neff"
+  ))
+  or_col <- pick_col(c("oddsratio", "odds_ratio", "or"))
+  hr_col <- pick_col(c("hr", "hazardratio", "hazard_ratio"))
+  ci_l_col <- pick_col(c("cilower", "ci_lower", "lowerci", "lower_ci", "lci", "ci_lower95", "lowerci95"))
+  ci_u_col <- pick_col(c("ciupper", "ci_upper", "upperci", "upper_ci", "uci", "ci_upper95", "upperci95"))
+
+  if (is.null(ea_col) || is.null(oa_col)) {
+    stop("Outcome format not recognised: missing effect/other allele columns.")
+  }
+  if (is.null(beta_col) && is.null(or_col) && is.null(hr_col)) {
+    stop("Outcome format not recognised: need beta or OR/HR columns.")
+  }
+  if (is.null(se_col) && (is.null(ci_l_col) || is.null(ci_u_col))) {
+    stop("Outcome format not recognised: need SE or confidence intervals.")
+  }
+
+  out <- data.table()
+  out[, effect_allele := toupper(as.character(dt[[ea_col]]))]
+  out[, other_allele := toupper(as.character(dt[[oa_col]]))]
+
+  if (!is.null(chr_col) && !is.null(pos_col)) {
+    out[, CHR := as.integer(gsub("^chr", "", as.character(dt[[chr_col]]), ignore.case = TRUE))]
+    out[, POS := as.integer(dt[[pos_col]])]
+  } else if (!is.null(snp_col)) {
+    parsed <- parse_marker(dt[[snp_col]])
+    out[, CHR := parsed$CHR]
+    out[, POS := parsed$POS]
+  } else {
+    out[, `:=`(CHR = NA_integer_, POS = NA_integer_)]
+  }
+
+  snp_raw <- if (!is.null(snp_col)) as.character(dt[[snp_col]]) else NA_character_
+  out[, snp := fifelse(is.finite(CHR) & is.finite(POS), paste0(CHR, ":", POS), snp_raw)]
+
+  out[, beta := NA_real_]
+  if (!is.null(beta_col)) out[, beta := suppressWarnings(as.numeric(dt[[beta_col]]))]
+
+  if (!is.null(or_col)) {
+    orv <- suppressWarnings(as.numeric(dt[[or_col]]))
+    out[!is.finite(beta) & is.finite(orv) & orv > 0, beta := log(orv)]
+  }
+  if (!is.null(hr_col)) {
+    hrv <- suppressWarnings(as.numeric(dt[[hr_col]]))
+    out[!is.finite(beta) & is.finite(hrv) & hrv > 0, beta := log(hrv)]
+  }
+
+  out[, se := NA_real_]
+  if (!is.null(se_col)) out[, se := suppressWarnings(as.numeric(dt[[se_col]]))]
+
+  if (all(!is.finite(out$se)) && !is.null(ci_l_col) && !is.null(ci_u_col)) {
+    lo <- suppressWarnings(as.numeric(dt[[ci_l_col]]))
+    hi <- suppressWarnings(as.numeric(dt[[ci_u_col]]))
+    if (!is.null(or_col) || !is.null(hr_col)) {
+      lo <- ifelse(is.finite(lo) & lo > 0, log(lo), NA_real_)
+      hi <- ifelse(is.finite(hi) & hi > 0, log(hi), NA_real_)
+    }
+    out[, se := (hi - lo) / (2 * 1.96)]
+  }
+
+  out[, pval := if (!is.null(pval_col)) suppressWarnings(as.numeric(dt[[pval_col]])) else NA_real_]
+  out[, eaf := if (!is.null(eaf_col)) suppressWarnings(as.numeric(dt[[eaf_col]])) else NA_real_]
+  out[, samplesize := if (!is.null(n_col)) suppressWarnings(as.numeric(dt[[n_col]])) else NA_real_]
+  out[, TotalSampleSize := samplesize]
+
+  if (all(!is.finite(out$pval)) && any(is.finite(out$beta)) && any(is.finite(out$se))) {
+    z <- out$beta / out$se
+    out[, pval := 2 * pnorm(-abs(z))]
+  }
+
+  if (verbose) {
+    message("Outcome columns used: ",
+            "CHR=", ifelse(is.null(chr_col), "NA", chr_col), ", ",
+            "POS=", ifelse(is.null(pos_col), "NA", pos_col), ", ",
+            "SNP=", ifelse(is.null(snp_col), "NA", snp_col), ", ",
+            "EA=", ea_col, ", OA=", oa_col, ", ",
+            "BETA=", ifelse(is.null(beta_col), "NA", beta_col), ", ",
+            "SE=", ifelse(is.null(se_col), "NA", se_col), ", ",
+            "P=", ifelse(is.null(pval_col), "NA", pval_col), ", ",
+            "EAF=", ifelse(is.null(eaf_col), "NA", eaf_col), ", ",
+            "N=", ifelse(is.null(n_col), "NA", n_col))
+  }
+
+  out <- out[!is.na(snp) & is.finite(beta) & is.finite(se) & se > 0]
+  out
+}
+
+# Wraps TwoSampleMR::format_data to convert our internal format into the
+# column-naming convention expected by harmonise_data() and mr().
+# Only passes optional columns (eaf, samplesize, chr, pos) when they are present.
+format_tsmr_data <- function(df, type, label) {
+  args <- list(
+    dat = as.data.frame(df),
+    type = type,
+    snp_col = "snp",
+    beta_col = "beta",
+    se_col = "se",
+    effect_allele_col = "effect_allele",
+    other_allele_col = "other_allele"
+  )
+
+  if ("pval" %in% names(df) && any(is.finite(df$pval))) args$pval_col <- "pval"
+  if ("eaf" %in% names(df) && any(is.finite(df$eaf))) args$eaf_col <- "eaf"
+  if ("samplesize" %in% names(df) && any(is.finite(df$samplesize))) args$samplesize_col <- "samplesize"
+  if (all(c("CHR", "POS") %in% names(df)) && any(is.finite(df$CHR)) && any(is.finite(df$POS))) {
+    args$chr_col <- "CHR"
+    args$pos_col <- "POS"
+  }
+
+  out <- do.call(TwoSampleMR::format_data, args)
+  if (type == "exposure") {
+    out$exposure <- label
+    out$id.exposure <- label
+  } else {
+    out$outcome <- label
+    out$id.outcome <- label
+  }
+  out
+}
+
+# Runs LD clumping via local PLINK using TwoSampleMR::clump_data().
+# Saves the pre- and post-clump data to outdir for auditing.
+# Returns the subset of exp_df rows corresponding to the lead (index) SNPs.
+clump_exposure_local_tsmr <- function(exp_df, cfg, ld_bfile, protein_of_interest, outdir) {
+  exp_fmt <- as.data.table(format_tsmr_data(exp_df, type = "exposure", label = protein_of_interest))
+
+  audit_input <- file.path(outdir, paste0(protein_of_interest, "_exp_for_clump_tsmr.tsv"))
+  safe_write_tsv(exp_fmt, audit_input)
+
+  clump_args <- list(
+    dat = as.data.frame(exp_fmt),
+    clump_kb = cfg$clump_kb,
+    clump_r2 = cfg$clump_r2,
+    clump_p1 = cfg$clump_p,
+    bfile = ld_bfile,
+    plink_bin = cfg$plink_bin
+  )
+
+  exp_clumped <- tryCatch(
+    as.data.table(do.call(TwoSampleMR::clump_data, clump_args)),
+    error = function(e) {
+      stop("TwoSampleMR clumping failed: ", e$message, call. = FALSE)
+    }
+  )
+
+  audit_output <- file.path(outdir, paste0(protein_of_interest, "_exp_clumped_tsmr.tsv"))
+  safe_write_tsv(exp_clumped, audit_output)
+
+  must_have(exp_clumped, "SNP", "TwoSampleMR clumped output")
+
+  lead_snps <- unique(trimws(as.character(exp_clumped$SNP)))
+  lead_snps <- lead_snps[!is.na(lead_snps) & lead_snps != ""]
+  if (length(lead_snps) == 0) {
+    stop("TwoSampleMR clumping produced no lead SNPs.")
+  }
+
+  exp_keep <- exp_df[snp %in% lead_snps]
+  if (nrow(exp_keep) == 0) {
+    stop("TwoSampleMR clumping returned lead SNPs that could not be mapped back to exposure instruments.")
+  }
+
+  exp_keep
+}
+
+# Writes a data.table to a tab-separated file, creating the directory if needed.
+safe_write_tsv <- function(dt, path) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  fwrite(as.data.table(dt), path, sep = "\t")
+}
+
+# Returns the complementary DNA base for each element (A↔T, C↔G).
+complement_alleles <- function(x) {
+  comp_base <- c(A = "T", T = "A", C = "G", G = "C")
+  x <- toupper(as.character(x))
+  out <- unname(comp_base[x])
+  out[is.na(out)] <- NA_character_
+  out
+}
+
+# Checks whether a SNP's alleles from the GWAS match those in the LD reference,
+# allowing for strand flips (complement) and allele ordering swaps.
+# Returns list(ok=TRUE, ld_effect, ld_other, mode) on success, or
+# list(ok=FALSE, reason) if alleles cannot be reconciled.
+align_dataset_alleles_to_ld <- function(effect_allele, other_allele, ld_a1, ld_a2) {
+  ea <- toupper(as.character(effect_allele))
+  oa <- toupper(as.character(other_allele))
+  ld_a1 <- toupper(as.character(ld_a1))
+  ld_a2 <- toupper(as.character(ld_a2))
+
+  valid <- c(ea, oa, ld_a1, ld_a2)
+  if (any(is.na(valid)) || any(!grepl("^[ACGT]$", valid))) {
+    return(list(ok = FALSE, reason = "non_acgt_or_missing"))
+  }
+
+  if (ea == ld_a1 && oa == ld_a2) {
+    return(list(ok = TRUE, ld_effect = ld_a1, ld_other = ld_a2, mode = "as_is"))
+  }
+  if (ea == ld_a2 && oa == ld_a1) {
+    return(list(ok = TRUE, ld_effect = ld_a2, ld_other = ld_a1, mode = "swap"))
+  }
+
+  c_a1 <- complement_alleles(ld_a1)
+  c_a2 <- complement_alleles(ld_a2)
+  if (ea == c_a1 && oa == c_a2) {
+    return(list(ok = TRUE, ld_effect = ld_a1, ld_other = ld_a2, mode = "complement"))
+  }
+  if (ea == c_a2 && oa == c_a1) {
+    return(list(ok = TRUE, ld_effect = ld_a2, ld_other = ld_a1, mode = "complement+swap"))
+  }
+
+  list(ok = FALSE, reason = "alleles_do_not_match_ld")
+}
+
+# Parses a PLINK phase string (e.g. "AG/TC") into the two haplotypes.
+# target_is_a=TRUE means the target SNP is SNP_A in the PLINK output; the
+# first character of each haplotype is the target allele, the second is proxy.
+parse_plink_phase <- function(phase, target_is_a) {
+  parts <- strsplit(as.character(phase), "/", fixed = TRUE)[[1]]
+  if (length(parts) != 2L || any(nchar(parts) != 2L)) return(NULL)
+
+  hap1 <- strsplit(parts[[1]], "", fixed = TRUE)[[1]]
+  hap2 <- strsplit(parts[[2]], "", fixed = TRUE)[[1]]
+
+  if (isTRUE(target_is_a)) {
+    list(
+      target = c(hap1[[1]], hap2[[1]]),
+      proxy = c(hap1[[2]], hap2[[2]])
+    )
+  } else {
+    list(
+      target = c(hap1[[2]], hap2[[2]]),
+      proxy = c(hap1[[1]], hap2[[1]])
+    )
+  }
+}
+
+# Uses the PLINK phase string to determine whether the proxy SNP's effect
+# direction should be flipped relative to the target SNP.
+# A flip is needed when the proxy effect allele is on the opposite haplotype
+# from the target effect allele.
+infer_proxy_flip_from_phase <- function(target_ld_effect, proxy_ld_effect, phase, target_is_a) {
+  parsed <- parse_plink_phase(phase, target_is_a = target_is_a)
+  if (is.null(parsed)) return(list(ok = FALSE, reason = "invalid_phase"))
+
+  target_idx <- which(parsed$target == target_ld_effect)
+  if (length(target_idx) != 1L) {
+    return(list(ok = FALSE, reason = "ambiguous_target_phase"))
+  }
+
+  if (parsed$proxy[target_idx] == proxy_ld_effect) {
+    return(list(ok = TRUE, flip = FALSE))
+  }
+
+  other_idx <- if (target_idx == 1L) 2L else 1L
+  if (parsed$proxy[other_idx] == proxy_ld_effect) {
+    return(list(ok = TRUE, flip = TRUE))
+  }
+
+  list(ok = FALSE, reason = "proxy_effect_not_present_in_phase")
+}
+
+# Returns a zero-row data.table with the expected schema for proxy search results,
+# used as a safe initialiser before rbindlist accumulation.
+empty_proxy_search_results <- function() {
+  data.table(
+    target_snp = character(),
+    proxy_snp = character(),
+    r2 = numeric(),
+    phase = character(),
+    target_is_a = logical(),
+    in_outcome = logical(),
+    ld_chr_a = integer(),
+    ld_bp_a = integer(),
+    ld_chr_b = integer(),
+    ld_bp_b = integer()
+  )
+}
+
+# Reads the .ld file produced by PLINK --r2 and extracts target/proxy SNP pairs
+# with their r², phase string, and genomic positions.
+parse_plink_proxy_output <- function(ld_path, target_snps) {
+  if (!file.exists(ld_path) || file.info(ld_path)$size == 0) {
+    return(empty_proxy_search_results())
+  }
+
+  ld <- suppressWarnings(fread(ld_path))
+  if (nrow(ld) == 0) return(empty_proxy_search_results())
+  setnames(ld, trimws(names(ld)))
+
+  must_have(ld, c("SNP_A", "SNP_B", "CHR_A", "CHR_B", "BP_A", "BP_B", "PHASE"), "PLINK LD output")
+  r2_col <- intersect(c("R2", "R^2", "R2.1"), names(ld))
+  if (length(r2_col) == 0) stop("PLINK LD output missing R2 column.")
+
+  ld <- as.data.table(ld)
+  target_snps <- unique(as.character(target_snps))
+  ld[, `:=`(
+    SNP_A = as.character(SNP_A),
+    SNP_B = as.character(SNP_B),
+    r2 = suppressWarnings(as.numeric(get(r2_col[[1]])))
+  )]
+  ld <- ld[is.finite(r2)]
+  if (nrow(ld) == 0) return(empty_proxy_search_results())
+
+  ld <- ld[
+    (SNP_A %chin% target_snps & SNP_B != SNP_A) |
+      (SNP_B %chin% target_snps & SNP_A != SNP_B)
+  ]
+  if (nrow(ld) == 0) return(empty_proxy_search_results())
+
+  ld[, target_snp := fifelse(SNP_A %chin% target_snps, SNP_A, SNP_B)]
+  ld[, target_is_a := SNP_A == target_snp]
+  ld[, proxy_snp := fifelse(target_is_a, SNP_B, SNP_A)]
+  ld[, `:=`(
+    phase = as.character(PHASE),
+    ld_chr_a = suppressWarnings(as.integer(CHR_A)),
+    ld_bp_a = suppressWarnings(as.integer(BP_A)),
+    ld_chr_b = suppressWarnings(as.integer(CHR_B)),
+    ld_bp_b = suppressWarnings(as.integer(BP_B))
+  )]
+
+  unique(ld[, .(
+    target_snp,
+    proxy_snp,
+    r2,
+    phase,
+    target_is_a,
+    in_outcome = FALSE,
+    ld_chr_a,
+    ld_bp_a,
+    ld_chr_b,
+    ld_bp_b
+  )])
+}
+
+# Calls PLINK --r2 for a single target SNP to find all LD proxies within
+# cfg$proxy_window_kb, returning results via parse_plink_proxy_output().
+run_plink_proxy_search <- function(target_snp, cfg, ld_bfile) {
+  out_prefix <- tempfile(
+    pattern = paste0("proxy_ld_", gsub("[^A-Za-z0-9]+", "_", target_snp), "_"),
+    tmpdir = tempdir()
+  )
+
+  args <- c(
+    "--bfile", ld_bfile,
+    "--r2", "in-phase", "with-freqs",
+    "--ld-snp", target_snp,
+    "--ld-window", "999999",
+    "--ld-window-kb", as.character(cfg$proxy_window_kb),
+    "--ld-window-r2", "0",
+    "--out", out_prefix
+  )
+
+  plink_log <- tryCatch(
+    system2(cfg$plink_bin, args = args, stdout = TRUE, stderr = TRUE),
+    error = function(e) {
+      stop("PLINK proxy search failed for ", target_snp, ": ", e$message, call. = FALSE)
+    }
+  )
+  status <- attr(plink_log, "status")
+  if (!is.null(status) && status != 0) {
+    stop(
+      "PLINK proxy search failed for ", target_snp, ": ",
+      paste(tail(plink_log, 20), collapse = "\n"),
+      call. = FALSE
+    )
+  }
+
+  parse_plink_proxy_output(paste0(out_prefix, ".ld"), target_snp)
+}
+
+# Batched version of run_plink_proxy_search() for multiple target SNPs.
+# Uses PLINK --ld-snp-list when available (one call for all SNPs); otherwise
+# falls back to looping run_plink_proxy_search() one SNP at a time.
+run_plink_proxy_search_many <- function(target_snps, cfg, ld_bfile) {
+  target_snps <- unique(as.character(target_snps))
+  target_snps <- target_snps[!is.na(target_snps) & nzchar(target_snps)]
+  if (length(target_snps) == 0L) {
+    return(empty_proxy_search_results())
+  }
+  if (length(target_snps) == 1L || !isTRUE(cfg$plink_has_ld_snp_list)) {
+    return(rbindlist(lapply(target_snps, run_plink_proxy_search, cfg = cfg, ld_bfile = ld_bfile), fill = TRUE))
+  }
+
+  out_prefix <- tempfile(pattern = "proxy_ld_batch_", tmpdir = tempdir())
+  snp_list_path <- paste0(out_prefix, "_targets.txt")
+  writeLines(target_snps, con = snp_list_path)
+
+  args <- c(
+    "--bfile", ld_bfile,
+    "--r2", "in-phase", "with-freqs",
+    "--ld-snp-list", snp_list_path,
+    "--ld-window", "999999",
+    "--ld-window-kb", as.character(cfg$proxy_window_kb),
+    "--ld-window-r2", "0",
+    "--out", out_prefix
+  )
+
+  plink_log <- tryCatch(
+    system2(cfg$plink_bin, args = args, stdout = TRUE, stderr = TRUE),
+    error = function(e) {
+      stop("PLINK batched proxy search failed: ", e$message, call. = FALSE)
+    }
+  )
+  status <- attr(plink_log, "status")
+  if (!is.null(status) && status != 0) {
+    stop(
+      "PLINK batched proxy search failed: ",
+      paste(tail(plink_log, 20), collapse = "\n"),
+      call. = FALSE
+    )
+  }
+
+  parse_plink_proxy_output(paste0(out_prefix, ".ld"), target_snps)
+}
+
+# Constructs a synthetic outcome row for a target SNP using a proxy SNP's
+# summary statistics. Aligns alleles via the LD reference, then applies a
+# sign flip to beta (and 1-eaf to EAF) if the phase indicates the proxy
+# effect allele is on the opposite haplotype from the target effect allele.
+build_proxy_outcome_row <- function(target_row, proxy_outcome_row, ld_hit, bim) {
+  target_bim <- bim[SNP == target_row$snp]
+  proxy_bim <- bim[SNP == proxy_outcome_row$snp]
+
+  if (nrow(target_bim) != 1L) {
+    return(list(ok = FALSE, reason = "target_ld_record_missing_or_duplicated"))
+  }
+  if (nrow(proxy_bim) != 1L) {
+    return(list(ok = FALSE, reason = "proxy_ld_record_missing_or_duplicated"))
+  }
+
+  target_map <- align_dataset_alleles_to_ld(
+    effect_allele = target_row$effect_allele,
+    other_allele = target_row$other_allele,
+    ld_a1 = target_bim$A1[[1]],
+    ld_a2 = target_bim$A2[[1]]
+  )
+  if (!isTRUE(target_map$ok)) return(list(ok = FALSE, reason = paste0("target_", target_map$reason)))
+
+  proxy_map <- align_dataset_alleles_to_ld(
+    effect_allele = proxy_outcome_row$effect_allele,
+    other_allele = proxy_outcome_row$other_allele,
+    ld_a1 = proxy_bim$A1[[1]],
+    ld_a2 = proxy_bim$A2[[1]]
+  )
+  if (!isTRUE(proxy_map$ok)) return(list(ok = FALSE, reason = paste0("proxy_", proxy_map$reason)))
+
+  flip_info <- infer_proxy_flip_from_phase(
+    target_ld_effect = target_map$ld_effect,
+    proxy_ld_effect = proxy_map$ld_effect,
+    phase = ld_hit$phase[[1]],
+    target_is_a = ld_hit$target_is_a[[1]]
+  )
+  if (!isTRUE(flip_info$ok)) return(list(ok = FALSE, reason = flip_info$reason))
+
+  proxy_snp <- as.character(proxy_outcome_row$snp[[1]])
+  syn <- copy(proxy_outcome_row)
+  syn[, proxy_target_snp := target_row$snp[[1]]]
+  syn[, proxy_snp := proxy_snp]
+  syn[, proxy_r2 := ld_hit$r2[[1]]]
+  syn[, proxy_phase := ld_hit$phase[[1]]]
+  syn[, proxy_beta_flipped := flip_info$flip]
+  syn[, proxy_source := "local_plink_ld"]
+
+  syn[, snp := target_row$snp[[1]]]
+  syn[, CHR := target_row$CHR[[1]]]
+  syn[, POS := target_row$POS[[1]]]
+  syn[, effect_allele := target_row$effect_allele[[1]]]
+  syn[, other_allele := target_row$other_allele[[1]]]
+  syn[, beta := if (isTRUE(flip_info$flip)) -beta else beta]
+  if ("eaf" %in% names(syn)) {
+    syn[, eaf := ifelse(is.finite(eaf) & isTRUE(flip_info$flip), 1 - eaf, eaf)]
+  }
+
+  list(ok = TRUE, row = syn, flip = flip_info$flip)
+}
+
+# For each exposure instrument missing from the outcome GWAS, searches for an
+# LD proxy (r² ≥ cfg$proxy_r2_min within cfg$proxy_window_kb) and substitutes
+# it using build_proxy_outcome_row(). Returns status per SNP and a combined
+# outcome table with proxies inserted in place of unmatched targets.
+rescue_outcome_proxies <- function(target_snps, exp_df, out_best, bim, cfg, ld_bfile) {
+  target_snps <- unique(as.character(target_snps))
+  exp_lookup <- copy(as.data.table(exp_df))
+  setindex(exp_lookup, snp)
+
+  out_best <- copy(as.data.table(out_best))
+  setindex(out_best, snp)
+
+  native_snps <- unique(out_best$snp[out_best$snp %chin% target_snps])
+  available_outcome_snps <- unique(out_best$snp)
+
+  status_dt <- data.table(target_snp = target_snps)
+  status_dt[, `:=`(
+    status = fifelse(target_snp %in% native_snps, "found_natively", NA_character_),
+    proxy_snp = NA_character_,
+    proxy_r2 = NA_real_,
+    proxy_beta_flipped = as.logical(NA),
+    message = NA_character_
+  )]
+
+  search_results <- empty_proxy_search_results()
+  rescued_rows <- list()
+
+  missing <- setdiff(target_snps, native_snps)
+  ld_hits_all <- empty_proxy_search_results()
+
+  if (length(missing) > 0L) {
+    ld_hits_all <- tryCatch(
+      run_plink_proxy_search_many(missing, cfg = cfg, ld_bfile = ld_bfile),
+      error = function(e) {
+        for (target_key in missing) {
+          ld_hits <- tryCatch(
+            run_plink_proxy_search(target_key, cfg = cfg, ld_bfile = ld_bfile),
+            error = function(e_single) {
+              status_dt[target_snp == target_key, `:=`(
+                status = "proxy_search_failed",
+                message = e_single$message
+              )]
+              NULL
+            }
+          )
+          if (!is.null(ld_hits)) {
+            ld_hits_all <<- rbindlist(list(ld_hits_all, ld_hits), fill = TRUE, use.names = TRUE)
+          }
+        }
+        ld_hits_all
+      }
+    )
+
+    if (nrow(ld_hits_all) > 0L) {
+      ld_hits_all[, in_outcome := proxy_snp %chin% available_outcome_snps]
+      search_results <- rbindlist(list(search_results, ld_hits_all), fill = TRUE, use.names = TRUE)
+    }
+  }
+
+  for (target_key in missing) {
+    ld_hits <- ld_hits_all[target_snp == target_key]
+    if (nrow(ld_hits) == 0) {
+      if (is.na(status_dt[target_snp == target_key, status][[1]])) {
+        status_dt[target_snp == target_key, `:=`(
+          status = "not_found_in_outcome",
+          message = "No LD proxy candidates found in search window."
+        )]
+      }
+      next
+    }
+
+    outcome_hits <- ld_hits[in_outcome == TRUE]
+    if (nrow(outcome_hits) == 0) {
+      status_dt[target_snp == target_key, `:=`(
+        status = "not_found_in_outcome",
+        message = "No LD proxy candidates were present in the outcome data."
+      )]
+      next
+    }
+
+    setorder(outcome_hits, -r2, proxy_snp)
+    if (!any(outcome_hits$r2 >= cfg$proxy_r2_min, na.rm = TRUE)) {
+      best_below <- outcome_hits[1]
+      status_dt[target_snp == target_key, `:=`(
+        status = "proxy_below_threshold",
+        proxy_snp = best_below$proxy_snp,
+        proxy_r2 = best_below$r2,
+        message = paste0("Best outcome proxy below r2 threshold of ", cfg$proxy_r2_min, ".")
+      )]
+      next
+    }
+
+    best_hit <- outcome_hits[r2 >= cfg$proxy_r2_min][1]
+    target_row <- exp_lookup[snp == target_key][1]
+    proxy_row <- out_best[snp == best_hit$proxy_snp][1]
+    built <- build_proxy_outcome_row(
+      target_row = target_row,
+      proxy_outcome_row = proxy_row,
+      ld_hit = best_hit,
+      bim = bim
+    )
+
+    if (!isTRUE(built$ok)) {
+      status_dt[target_snp == target_key, `:=`(
+        status = "proxy_ambiguous_phase_or_alleles",
+        proxy_snp = best_hit$proxy_snp,
+        proxy_r2 = best_hit$r2,
+        message = built$reason
+      )]
+      next
+    }
+
+    rescued_rows[[length(rescued_rows) + 1L]] <- built$row
+    status_dt[target_snp == target_key, `:=`(
+      status = "rescued_by_proxy",
+      proxy_snp = best_hit$proxy_snp,
+      proxy_r2 = best_hit$r2,
+      proxy_beta_flipped = isTRUE(built$flip),
+      message = "Proxy substituted from local PLINK LD search."
+    )]
+  }
+
+  rescued_dt <- if (length(rescued_rows) > 0L) {
+    rbindlist(rescued_rows, fill = TRUE, use.names = TRUE)
+  } else {
+    out_best[0]
+  }
+  unresolved_dt <- status_dt[status %in% c("not_found_in_outcome", "proxy_below_threshold", "proxy_ambiguous_phase_or_alleles", "proxy_search_failed")]
+
+  list(
+    status = status_dt,
+    search_results = search_results,
+    rescued_rows = rescued_dt,
+    unresolved = unresolved_dt
+  )
+}
+
+# Runs the Steiger directionality test to check that the protein (exposure)
+# explains more variance in its own GWAS than in the outcome GWAS, confirming
+# the assumed causal direction. Requires sample sizes; falls back to
+# cfg$steiger_exposure_N / cfg$steiger_outcome_N when not in the harmonised data.
+run_steiger_directionality <- function(d1, cfg, protein_of_interest) {
+  dt <- as.data.table(d1)
+  if (nrow(dt) < cfg$steiger_min_snps) return(NULL)
+
+  dt[, pval.exposure := suppressWarnings(as.numeric(pval.exposure))]
+  dt[, pval.outcome := suppressWarnings(as.numeric(pval.outcome))]
+
+  bad_px <- !is.finite(dt$pval.exposure)
+  bad_py <- !is.finite(dt$pval.outcome)
+  if (any(bad_px)) dt[bad_px, pval.exposure := 2 * pnorm(-abs(beta.exposure / se.exposure))]
+  if (any(bad_py)) dt[bad_py, pval.outcome := 2 * pnorm(-abs(beta.outcome / se.outcome))]
+
+  if (!("samplesize.exposure" %in% names(dt))) dt[, samplesize.exposure := NA_real_]
+  if (!("samplesize.outcome" %in% names(dt))) dt[, samplesize.outcome := NA_real_]
+  dt[, samplesize.exposure := suppressWarnings(as.numeric(samplesize.exposure))]
+  dt[, samplesize.outcome := suppressWarnings(as.numeric(samplesize.outcome))]
+
+  if (is.finite(cfg$steiger_exposure_N)) dt[!is.finite(samplesize.exposure), samplesize.exposure := cfg$steiger_exposure_N]
+  if (is.finite(cfg$steiger_outcome_N)) dt[!is.finite(samplesize.outcome), samplesize.outcome := cfg$steiger_outcome_N]
+
+  if (any(is.finite(dt$samplesize.exposure))) {
+    n_exp <- median(dt$samplesize.exposure[is.finite(dt$samplesize.exposure)], na.rm = TRUE)
+    dt[!is.finite(samplesize.exposure), samplesize.exposure := n_exp]
+  }
+  if (any(is.finite(dt$samplesize.outcome))) {
+    n_out <- median(dt$samplesize.outcome[is.finite(dt$samplesize.outcome)], na.rm = TRUE)
+    dt[!is.finite(samplesize.outcome), samplesize.outcome := n_out]
+  }
+
+  dt <- dt[
+    is.finite(pval.exposure) &
+      is.finite(pval.outcome) &
+      is.finite(samplesize.exposure) &
+      is.finite(samplesize.outcome)
+  ]
+  if (nrow(dt) < cfg$steiger_min_snps) return(NULL)
+
+  res <- tryCatch(
+    TwoSampleMR::directionality_test(as.data.frame(dt)),
+    error = function(e) {
+      message("Steiger failed for ", protein_of_interest, ": ", e$message)
+      NULL
+    }
+  )
+  if (is.null(res) || nrow(res) == 0) return(NULL)
+
+  out <- as.data.table(res)
+  out[, `:=`(
+    protein = protein_of_interest,
+    nsnp_steiger = nrow(dt)
+  )]
+  out
+}
+
+# Runs MR-PRESSO to detect and correct for horizontal pleiotropy outliers.
+# Requires ≥ cfg$mr_presso_min_snps instruments. Returns a list with the
+# main MR estimates, global test p-value, per-SNP outlier test, and
+# distortion test (comparing corrected vs uncorrected estimates).
+run_mr_presso_test <- function(d1, cfg, protein_of_interest) {
+  dt <- as.data.table(d1)
+  dt <- dt[
+    is.finite(beta.outcome) & is.finite(beta.exposure) &
+      is.finite(se.outcome) & is.finite(se.exposure) &
+      se.outcome > 0 & se.exposure > 0
+  ]
+
+  if (nrow(dt) < cfg$mr_presso_min_snps) return(NULL)
+
+  presso_res <- tryCatch(
+    MRPRESSO::mr_presso(
+      BetaOutcome = "beta.outcome",
+      BetaExposure = "beta.exposure",
+      SdOutcome = "se.outcome",
+      SdExposure = "se.exposure",
+      OUTLIERtest = isTRUE(cfg$mr_presso_outlier_test),
+      DISTORTIONtest = isTRUE(cfg$mr_presso_distortion_test),
+      data = as.data.frame(dt),
+      NbDistribution = as.integer(cfg$mr_presso_nb_distribution),
+      SignifThreshold = as.numeric(cfg$mr_presso_signif_threshold)
+    ),
+    error = function(e) {
+      message("MR-PRESSO failed for ", protein_of_interest, ": ", e$message)
+      NULL
+    }
+  )
+  if (is.null(presso_res)) return(NULL)
+
+  get_comp <- function(obj, nm) {
+    if (!is.null(obj[[nm]])) return(obj[[nm]])
+    if (!is.null(obj[["MR-PRESSO results"]]) && !is.null(obj[["MR-PRESSO results"]][[nm]])) {
+      return(obj[["MR-PRESSO results"]][[nm]])
+    }
+    NULL
+  }
+
+  as_dt <- function(x, row_col = NULL) {
+    if (is.null(x)) return(NULL)
+    if (is.data.frame(x)) {
+      if (!is.null(row_col)) return(as.data.table(x, keep.rownames = row_col))
+      return(as.data.table(x))
+    }
+    if (is.atomic(x) && length(x) > 0) return(as.data.table(as.list(x)))
+    if (is.list(x)) return(as.data.table(x))
+    NULL
+  }
+
+  main_dt <- as_dt(get_comp(presso_res, "Main MR results"), row_col = "method")
+  global_dt <- as_dt(get_comp(presso_res, "Global Test"))
+  outlier_dt <- as_dt(get_comp(presso_res, "Outlier Test"), row_col = "SNP")
+  distortion_raw <- get_comp(presso_res, "Distortion Test")
+
+  distortion_dt <- NULL
+  if (is.list(distortion_raw)) {
+    distortion_dt <- as.data.table(data.frame(
+      distortion_coefficient = first_numeric_or_na(distortion_raw[["Distortion Coefficient"]]),
+      pval = first_numeric_or_na(distortion_raw[["P-value"]]),
+      stringsAsFactors = FALSE
+    ))
+    outlier_idx <- distortion_raw[["Outliers Indices"]]
+    if (!is.null(outlier_idx)) {
+      distortion_dt[, outliers_indices := paste(as.character(outlier_idx), collapse = ",")]
+    }
+  } else if (is.data.frame(distortion_raw)) {
+    distortion_dt <- as.data.table(distortion_raw)
+  }
+
+  add_meta <- function(x) {
+    if (is.null(x)) return(NULL)
+    x[, `:=`(protein = protein_of_interest, nsnp_mr_presso = nrow(dt))]
+    x
+  }
+
+  list(
+    main = add_meta(main_dt),
+    global = add_meta(global_dt),
+    outlier = add_meta(outlier_dt),
+    distortion = add_meta(distortion_dt)
+  )
+}
+
+# Saves run reproducibility files to outdir_base:
+#   _run_config.tsv       — all cfg settings
+#   _protein_settings.tsv — protein/chromosome/position table
+#   _package_versions.tsv — versions of all used packages
+#   _sessionInfo.txt      — full R session info
+write_run_metadata <- function(cfg, outdir_base, protein_settings) {
+  cfg_dt <- data.table(
+    setting = names(cfg),
+    value = vapply(cfg, function(x) paste(as.character(x), collapse = ","), character(1))
+  )
+  safe_write_tsv(cfg_dt, file.path(outdir_base, "_run_config.tsv"))
+  safe_write_tsv(as.data.table(protein_settings), file.path(outdir_base, "_protein_settings.tsv"))
+
+  pkgs <- c("data.table", "dplyr", "TwoSampleMR", "ggplot2", "coloc", "MRPRESSO")
+  pkg_dt <- data.table(
+    package = pkgs,
+    version = vapply(
+      pkgs,
+      function(p) {
+        if (requireNamespace(p, quietly = TRUE)) as.character(packageVersion(p)) else NA_character_
+      },
+      character(1)
+    )
+  )
+  safe_write_tsv(pkg_dt, file.path(outdir_base, "_package_versions.tsv"))
+
+  session_txt <- capture.output(sessionInfo())
+  writeLines(session_txt, con = file.path(outdir_base, "_sessionInfo.txt"))
+}
+
+# Draws a forest plot of MR estimates across methods (IVW, Egger, median, mode).
+# plot_on="or" exponentiates betas to odds ratios; plot_on="beta" plots on the
+# original scale. CIs that exceed the axis are shown as arrows.
+make_mr_methods_forest_caption <- function(mr_res,
+                                           title,
+                                           outfile,
+                                           sig_level = 0.05,
+                                           plot_on = c("or", "beta"),
+                                           auto_xlim = TRUE,
+                                           xlim_exclude = c("MR Egger"),
+                                           pad_mult = 1.15,
+                                           x_min = NULL,
+                                           x_max = NULL,
+                                           xlab = "OR and 95% CI",
+                                           caption = NULL) {
+  plot_on <- match.arg(plot_on)
+
+  dd <- mr_res %>%
+    dplyr::select(method, b, se, pval, nsnp) %>%
+    dplyr::mutate(
+      method = as.character(method),
+      b = as.numeric(b),
+      se = as.numeric(se),
+      pval = suppressWarnings(as.numeric(pval))
+    ) %>%
+    dplyr::filter(is.finite(b), is.finite(se))
+
+  if (nrow(dd) == 0) stop("No finite b/se in mr_res.")
+
+  if (plot_on == "or") {
+    dd <- dd %>% mutate(est = exp(b), lo = exp(b - 1.96 * se), hi = exp(b + 1.96 * se), null = 1)
+  } else {
+    dd <- dd %>% mutate(est = b, lo = b - 1.96 * se, hi = b + 1.96 * se, null = 0)
+  }
+
+  preferred <- c("Inverse variance weighted", "MR Egger", "Weighted median", "Weighted mode")
+  present <- unique(dd$method)
+  levs <- c(intersect(preferred, present), setdiff(present, preferred))
+
+  dd <- dd %>% mutate(method = factor(method, levels = levs)) %>% arrange(method)
+
+  if (auto_xlim) {
+    dd_lim <- dd %>% filter(!as.character(method) %in% xlim_exclude)
+    if (nrow(dd_lim) == 0) dd_lim <- dd
+
+    if (plot_on == "or") {
+      xmin0 <- min(dd_lim$lo, dd$null, na.rm = TRUE)
+      xmax0 <- max(dd_lim$hi, dd$null, na.rm = TRUE)
+      xmin0 <- max(xmin0, 1e-12)
+      x_min <- xmin0 / pad_mult
+      x_max <- xmax0 * pad_mult
+    } else {
+      xmin0 <- min(dd_lim$lo, dd$null, na.rm = TRUE)
+      xmax0 <- max(dd_lim$hi, dd$null, na.rm = TRUE)
+      rng <- xmax0 - xmin0
+      x_min <- xmin0 - 0.05 * rng
+      x_max <- xmax0 + 0.05 * rng
+    }
+  } else if (is.null(x_min) || is.null(x_max)) {
+    stop("If auto_xlim=FALSE, provide x_min and x_max.")
+  }
+
+  dd <- dd %>%
+    mutate(
+      sig = ifelse(!is.na(pval) & pval < sig_level, "sig", "ns"),
+      lo_clip = pmax(lo, x_min),
+      hi_clip = pmin(hi, x_max),
+      right_over = hi > x_max,
+      left_over = lo < x_min
+    )
+
+  if (plot_on == "or") {
+    dd <- dd %>% mutate(est_plot = pmin(pmax(est, x_min * 1.02), x_max / 1.02))
+  } else {
+    eps <- 0.01 * (x_max - x_min)
+    dd <- dd %>% mutate(est_plot = pmin(pmax(est, x_min + eps), x_max - eps))
+  }
+
+  p <- ggplot(dd, aes(y = method, x = est_plot)) +
+    geom_vline(xintercept = unique(dd$null), linetype = "dashed") +
+    geom_errorbarh(aes(xmin = lo_clip, xmax = hi_clip, color = sig), height = 0) +
+    geom_point(aes(color = sig), size = 3) +
+    geom_segment(data = subset(dd, right_over),
+                 aes(x = x_max - 0.03 * (x_max - x_min), xend = x_max, y = method, yend = method, color = sig),
+                 arrow = arrow(length = unit(0.12, "inches"))) +
+    geom_segment(data = subset(dd, left_over),
+                 aes(x = x_min + 0.03 * (x_max - x_min), xend = x_min, y = method, yend = method, color = sig),
+                 arrow = arrow(length = unit(0.12, "inches"))) +
+    scale_color_manual(values = c(sig = "red", ns = "black")) +
+    coord_cartesian(xlim = c(x_min, x_max)) +
+    scale_y_discrete(limits = rev(levs)) +
+    labs(title = title, x = xlab, y = NULL, caption = caption) +
+    theme_classic() +
+    theme(legend.position = "none", plot.caption = element_text(hjust = 0))
+
+  ggsave(outfile, plot = p, width = 6, height = 4, dpi = 200)
+  p
+}
+```
+
+## Step 1: Read and Standardize Inputs
+
+```{r step1_read_inputs}
+exp0 <- fread(cfg$exposure_path, check.names = FALSE)
+out0 <- fread(cfg$outcome_path, check.names = FALSE)
+bim <- read_bim(cfg$ld_bfile)
+
+ld_fix <- ensure_unique_ld_bfile(
+  bfile = cfg$ld_bfile,
+  bim = bim,
+  outdir_base = cfg$outdir_base,
+  force = FALSE
+)
+ld_bfile <- ld_fix$bfile
+bim <- ld_fix$bim
+
+exp1 <- standardise_exposure(exp0)
+out1 <- standardise_outcome(out0)
+out1_best <- deduplicate_by_snp(out1[is.finite(beta) & is.finite(se) & se > 0])
+
+setindexv(exp1, c("protein_key", "CHR", "POS", "snp"))
+setindexv(out1, c("snp"))
+setindexv(out1, c("CHR", "POS"))
+setindexv(out1_best, c("snp"))
+setindexv(out1_best, c("CHR", "POS"))
+setindexv(bim, c("SNP"))
+
+cat("Exposure rows raw:", nrow(exp0), "| standardized:", nrow(exp1), "\n")
+cat("Outcome rows raw:", nrow(out0), "| standardized:", nrow(out1), "\n")
+cat("Outcome rows for lookup:", nrow(out1_best), "\n")
+cat("LD BIM rows:", nrow(bim), "\n")
+
+safe_write_tsv(exp1[, !c("protein_key"), with = FALSE], file.path(cfg$outdir_base, "_global_exposure_standardized.tsv"))
+safe_write_tsv(out1, file.path(cfg$outdir_base, "_global_outcome_standardized.tsv"))
+write_run_metadata(cfg, cfg$outdir_base, protein_settings)
+```
+
+## Step 2: Per-Protein MR Function
+
+```{r step2_function}
+run_one_protein <- function(protein_of_interest, gene_chr, gene_pos, exp1, out1, out1_best, bim, ld_bfile, cfg) {
+  exposure_name <- protein_of_interest
+  outdir <- file.path(cfg$outdir_base, protein_of_interest)
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+  diag <- instrument_diag_init(protein_of_interest, gene_chr, gene_pos, cfg)
+  diag_fail_step <- NA_character_
+  diag_fail_message <- NA_character_
+  nsnp <- NA_integer_
+
+  mr_res <- NULL
+  res_wald <- NULL
+  res_wald_top <- NULL
+  het <- NULL
+  pleio <- NULL
+  loo <- NULL
+  loo_s <- NULL
+  mr_out <- NULL
+  singlesnp_res <- NULL
+  steiger_summary <- NULL
+  mr_presso_main <- NULL
+  mr_presso_global <- NULL
+  mr_presso_outlier <- NULL
+  mr_presso_distortion <- NULL
+  coloc_summary <- NULL
+  optional_failures <- data.table(step = character(), message = character())
+  protein_key_value <- toupper(protein_of_interest)
+
+  tryCatch({
+    # Define the cis window: gene position ± cfg$cis_kb kilobases.
+    cis_start <- gene_pos - cfg$cis_kb * 1000
+    cis_end <- gene_pos + cfg$cis_kb * 1000
+    log10p_thresh <- -log10(cfg$p_threshold)
+
+    # Step 1: Subset exposure SNPs to cis window for this protein.
+    exp_prot_all <- exp1[protein_key == protein_key_value]
+    exp_chr_all <- exp_prot_all[CHR == gene_chr]
+    exp_cis_all <- exp_chr_all[POS >= cis_start & POS <= cis_end]
+
+    diag <- instrument_diag_set(
+      diag,
+      n_exp_protein_total = nrow(exp_prot_all),
+      n_exp_chr_total = nrow(exp_chr_all),
+      n_exp_cis_total = nrow(exp_cis_all)
+    )
+
+    cat("----\n")
+    cat("Protein:", protein_of_interest, "| chr:", gene_chr, "| pos:", gene_pos, "\n")
+
+    # Step 2: Apply genome-wide significance threshold (P < cfg$p_threshold).
+    exp2 <- copy(exp_cis_all[neglog10p >= log10p_thresh])
+
+    diag <- instrument_diag_set(
+      diag,
+      n_exp_after_p = nrow(exp2),
+      n_exp_with_eaf = sum(is.finite(exp2$eaf)),
+    )
+    if (nrow(exp2) == 0) {
+      diag_fail_step <- "cis+pval"
+      diag_fail_message <- "No exposure variants after cis + p-value filtering."
+      stop(diag_fail_message)
+    }
+
+    # Step 3: F-statistic filter for instrument strength (F = (beta/se)^2 ≥ 10).
+    exp2[, Fstat := (beta / se)^2]
+    exp2 <- exp2[Fstat >= cfg$f_threshold]
+    diag <- instrument_diag_set(diag, n_exp_after_f = nrow(exp2))
+    if (nrow(exp2) == 0) {
+      diag_fail_step <- "Fstat"
+      diag_fail_message <- "All exposure instruments removed by F-stat filter."
+      stop(diag_fail_message)
+    }
+
+    exp2 <- deduplicate_by_snp(exp2)
+    diag <- instrument_diag_set(diag, n_exp_unique_snp = nrow(exp2))
+
+    cat("Exposure instruments before LD overlap:", nrow(exp2), "\n")
+
+    # Step 4: Split instruments into those present in the LD reference and those
+    # absent. Only SNPs in the LD reference can be LD-clumped; missing ones are
+    # saved for review but cannot be used as instruments.
+    bim_ids <- bim$SNP
+    exp2_in_ld <- copy(exp2[snp %chin% bim_ids])
+    exp2_missing <- copy(exp2[!snp %chin% bim_ids])
+
+    diag <- instrument_diag_set(
+      diag,
+      n_exp_in_ld = nrow(exp2_in_ld),
+      n_exp_missing_ld = nrow(exp2_missing),
+      n_exp_to_clump = nrow(exp2_in_ld)
+    )
+
+    cat("LD overlap:", nrow(exp2_in_ld), "of", nrow(exp2), "\n")
+
+    if (nrow(exp2_in_ld) == 0) {
+      diag_fail_step <- "ld_overlap"
+      diag_fail_message <- "0 overlap between exposure instruments and LD reference. Check build or variant ID mapping."
+      stop(diag_fail_message)
+    }
+
+    # Step 5: LD clumping to select independent instruments (r² < cfg$clump_r2).
+    # Skipped when only one SNP is present in the LD reference.
+    if (nrow(exp2_in_ld) == 1) {
+      exp3 <- copy(exp2_in_ld)
+      cat("Only one instrument in LD reference; clumping skipped.\n")
+    } else {
+      exp3 <- clump_exposure_local_tsmr(
+        exp_df = exp2_in_ld,
+        cfg = cfg,
+        ld_bfile = ld_bfile,
+        protein_of_interest = protein_of_interest,
+        outdir = outdir
+      )
+    }
+
+    exp3 <- deduplicate_by_snp(exp3)
+    diag <- instrument_diag_set(diag, n_exp_after_clump = nrow(exp3))
+
+    safe_write_tsv(exp3, file.path(outdir, "exposure_instruments_final.tsv"))
+    if (nrow(exp2_missing) > 0) safe_write_tsv(exp2_missing, file.path(outdir, "instruments_missing_in_ld.tsv"))
+
+    target_snps <- unique(exp3$snp)
+    out_use <- copy(out1_best[snp %chin% target_snps])
+
+    missing <- setdiff(target_snps, unique(out_use$snp))
+    if (length(missing) > 0) {
+      safe_write_tsv(
+        data.table(missing_snp = missing),
+        file.path(outdir, paste0(protein_of_interest, "_missing_in_outcome_snps.tsv"))
+      )
+    }
+
+    # Step 6: Match instruments to outcome. For SNPs absent from the outcome
+    # GWAS, search for LD proxies (r² ≥ cfg$proxy_r2_min) and substitute them.
+    if (isTRUE(cfg$use_outcome_proxies)) {
+      proxy_res <- rescue_outcome_proxies(
+        target_snps = target_snps,
+        exp_df = exp3,
+        out_best = out1_best,
+        bim = bim,
+        cfg = cfg,
+        ld_bfile = ld_bfile
+      )
+
+      safe_write_tsv(proxy_res$search_results, file.path(outdir, "proxy_search_results.tsv"))
+      safe_write_tsv(proxy_res$status, file.path(outdir, "proxy_substitutions.tsv"))
+      safe_write_tsv(proxy_res$unresolved, file.path(outdir, "missing_in_outcome_no_proxy.tsv"))
+
+      rescued_snps <- unique(proxy_res$status[status == "rescued_by_proxy", target_snp])
+      keep_snps <- unique(proxy_res$status[status %in% c("found_natively", "rescued_by_proxy"), target_snp])
+
+      exp3 <- exp3[snp %chin% keep_snps]
+      target_snps <- unique(exp3$snp)
+      out_use <- copy(out1_best[snp %chin% target_snps])
+      if (nrow(proxy_res$rescued_rows) > 0) {
+        out_use <- rbindlist(list(out_use, proxy_res$rescued_rows), fill = TRUE, use.names = TRUE)
+        out_use <- out_use[!(snp %chin% rescued_snps & (is.na(proxy_source) | proxy_source != "local_plink_ld"))]
+      }
+    } else if (length(missing) > 0) {
+      exp3 <- exp3[!snp %chin% missing]
+      target_snps <- unique(exp3$snp)
+      out_use <- out_use[!snp %chin% missing]
+    }
+
+    out_use <- deduplicate_by_snp(out_use)
+
+    diag <- instrument_diag_set(
+      diag,
+      n_outcome_overlap = nrow(out_use),
+      n_outcome_with_eaf = sum(is.finite(out_use$eaf)),
+    )
+
+    if (length(target_snps) == 0 || nrow(exp3) == 0 || nrow(out_use) == 0) {
+      diag_fail_step <- "outcome_overlap"
+      diag_fail_message <- "No instruments remain after outcome overlap filtering."
+      stop(diag_fail_message)
+    }
+
+    exposure_dat <- format_tsmr_data(exp3, type = "exposure", label = exposure_name)
+    outcome_dat <- format_tsmr_data(out_use, type = "outcome", label = cfg$outcome_name)
+
+    common <- intersect(exposure_dat$SNP, outcome_dat$SNP)
+    exposure_dat <- exposure_dat[exposure_dat$SNP %in% common, ]
+    outcome_dat <- outcome_dat[outcome_dat$SNP %in% common, ]
+
+    diag <- instrument_diag_set(diag, n_after_format_overlap = length(common))
+
+    if (nrow(exposure_dat) == 0) {
+      diag_fail_step <- "format_overlap"
+      diag_fail_message <- "No overlapping SNPs after formatting."
+      stop(diag_fail_message)
+    }
+
+    # Step 7: Harmonise alleles between exposure and outcome. action=2 tries to
+    # align ambiguous palindromic SNPs using EAF; drop_palindromic_harmonised()
+    # then removes all palindromics regardless (conservative, equivalent to action=3).
+    dat_h <- harmonise_data(exposure_dat, outcome_dat, action = cfg$harmonise_action)
+    dat_h <- drop_palindromic_harmonised(dat_h)
+
+    audit <- attr(dat_h, "audit")
+    if (!is.null(audit)) {
+      safe_write_tsv(as.data.table(audit), file.path(outdir, "harmonise_audit.tsv"))
+    }
+
+    pal_removed <- attr(dat_h, "palindromic_removed")
+    if (!is.null(pal_removed) && nrow(pal_removed) > 0) {
+      safe_write_tsv(as.data.table(pal_removed), file.path(outdir, "palindromic_snps_removed.tsv"))
+    }
+
+    d1 <- dat_h[dat_h$mr_keep == TRUE, ]
+    nsnp <- nrow(d1)
+    diag <- instrument_diag_set(
+      diag,
+      n_after_harmonise = nrow(dat_h),
+      n_palindromic_removed = if (!is.null(pal_removed)) nrow(as.data.table(pal_removed)) else 0L,
+      n_mr_keep = nsnp
+    )
+    if (nsnp == 0) {
+      diag_fail_step <- "harmonise_mr_keep"
+      diag_fail_message <- "No valid instruments after harmonisation."
+      stop(diag_fail_message)
+    }
+
+    # Step 8: Run MR. With 1 instrument: Wald ratio. With ≥2: IVW (primary);
+    # weighted median added at ≥3 SNPs; Egger and weighted mode at ≥10 SNPs.
+    # A "top SNP" Wald ratio is always computed alongside multi-instrument IVW
+    # for comparison.
+    if (nsnp == 1) {
+      bx <- d1$beta.exposure
+      bxse <- d1$se.exposure
+      by <- d1$beta.outcome
+      byse <- d1$se.outcome
+
+      if (abs(bx) < 1e-8) stop("Exposure beta too close to 0 for Wald ratio.")
+
+      b_wald <- by / bx
+      se_wald <- sqrt((byse^2) / (bx^2) + (by^2 * bxse^2) / (bx^4))
+      p_wald <- 2 * pnorm(abs(b_wald / se_wald), lower.tail = FALSE)
+
+      res_wald <- data.frame(
+        protein = protein_of_interest,
+        method = "Wald ratio",
+        nsnp = 1,
+        b = b_wald,
+        se = se_wald,
+        pval = p_wald,
+        top_snp = as.character(d1$SNP),
+        stringsAsFactors = FALSE
+      )
+
+      mr_res <- res_wald
+    } else {
+      methods <- c("mr_ivw")
+      if (nsnp >= 3) methods <- c(methods, "mr_weighted_median")
+      if (nsnp >= 10) methods <- c(methods, "mr_egger_regression", "mr_weighted_mode")
+
+      mr_out <- mr(d1, method_list = methods)
+      mr_res <- mr_out %>%
+        dplyr::mutate(protein = protein_of_interest, top_snp = NA_character_) %>%
+        dplyr::select(protein, method, nsnp, b, se, pval, top_snp) %>%
+        as.data.frame()
+
+      d1_dt <- as.data.table(d1)
+      d1_dt[, pval.exposure := suppressWarnings(as.numeric(pval.exposure))]
+      if (all(!is.finite(d1_dt$pval.exposure))) {
+        d1_dt[, pval.exposure := 2 * pnorm(-abs(beta.exposure / se.exposure))]
+      }
+
+      d1_dt <- d1_dt[is.finite(pval.exposure)]
+      if (nrow(d1_dt) > 0) {
+        d1_dt[, Fstat := (beta.exposure / se.exposure)^2]
+        d1_dt[, abs_bx := abs(beta.exposure)]
+        setorder(d1_dt, pval.exposure, -Fstat, -abs_bx)
+        top_snp <- d1_dt[1]
+
+        b_top <- top_snp$beta.outcome / top_snp$beta.exposure
+        se_top <- sqrt((top_snp$se.outcome^2) / (top_snp$beta.exposure^2) +
+                       (top_snp$beta.outcome^2 * top_snp$se.exposure^2) / (top_snp$beta.exposure^4))
+        p_top <- 2 * pnorm(abs(b_top / se_top), lower.tail = FALSE)
+
+        res_wald_top <- data.frame(
+          protein = protein_of_interest,
+          method = "Wald ratio (top SNP)",
+          nsnp = 1,
+          b = b_top,
+          se = se_top,
+          pval = p_top,
+          top_snp = top_snp$SNP,
+          stringsAsFactors = FALSE
+        )
+
+        mr_res <- bind_rows(mr_res, res_wald_top) %>% as.data.frame()
+      }
+
+      if (nsnp >= 3) {
+        het <- mr_heterogeneity(d1)
+        pleio <- mr_pleiotropy_test(d1)
+      }
+
+      loo <- mr_leaveoneout(d1)
+      loo_s <- loo %>%
+        mutate(
+          exp_beta = exp(b),
+          exp_beta_lci95 = exp(b - 1.96 * se),
+          exp_beta_uci95 = exp(b + 1.96 * se)
+        ) %>%
+        arrange(p)
+    }
+
+    safe_write_tsv(dat_h, file.path(outdir, "harmonised_dat.tsv"))
+    if (!is.null(mr_res)) safe_write_tsv(mr_res, file.path(outdir, "mr_results.tsv"))
+    if (!is.null(res_wald_top)) safe_write_tsv(res_wald_top, file.path(outdir, "wald_ratio_top_snp.tsv"))
+    if (!is.null(het)) safe_write_tsv(het, file.path(outdir, "heterogeneity.tsv"))
+    if (!is.null(pleio)) safe_write_tsv(pleio, file.path(outdir, "pleiotropy.tsv"))
+    if (!is.null(loo)) safe_write_tsv(loo, file.path(outdir, "leaveoneout.tsv"))
+    if (!is.null(loo_s)) safe_write_tsv(loo_s, file.path(outdir, "leaveoneout_summary.tsv"))
+
+    if (isTRUE(cfg$run_steiger)) {
+      tryCatch({
+        steiger_summary <- run_steiger_directionality(d1, cfg, protein_of_interest)
+        if (!is.null(steiger_summary)) {
+          safe_write_tsv(steiger_summary, file.path(outdir, "steiger_summary.tsv"))
+        } else {
+          cat("Steiger skipped for", protein_of_interest, ": missing p/N information after harmonization.\n")
+        }
+      }, error = function(e) {
+        optional_failures <<- rbind(
+          optional_failures,
+          data.table(step = "Steiger", message = e$message),
+          fill = TRUE
+        )
+        message("Optional step failed for ", protein_of_interest, " [Steiger]: ", e$message)
+      })
+    }
+
+    if (isTRUE(cfg$run_mr_presso)) {
+      tryCatch({
+        presso <- run_mr_presso_test(d1, cfg, protein_of_interest)
+        if (!is.null(presso)) {
+          mr_presso_main <- presso$main
+          mr_presso_global <- presso$global
+          mr_presso_outlier <- presso$outlier
+          mr_presso_distortion <- presso$distortion
+
+          if (!is.null(mr_presso_main)) safe_write_tsv(mr_presso_main, file.path(outdir, "mr_presso_main.tsv"))
+          if (!is.null(mr_presso_global)) safe_write_tsv(mr_presso_global, file.path(outdir, "mr_presso_global.tsv"))
+          if (!is.null(mr_presso_outlier)) safe_write_tsv(mr_presso_outlier, file.path(outdir, "mr_presso_outlier.tsv"))
+          if (!is.null(mr_presso_distortion)) safe_write_tsv(mr_presso_distortion, file.path(outdir, "mr_presso_distortion.tsv"))
+        } else {
+          cat("MR-PRESSO skipped for", protein_of_interest, ": requires >= ", cfg$mr_presso_min_snps, " valid SNPs.\n")
+        }
+      }, error = function(e) {
+        optional_failures <<- rbind(
+          optional_failures,
+          data.table(step = "MR-PRESSO", message = e$message),
+          fill = TRUE
+        )
+        message("Optional step failed for ", protein_of_interest, " [MR-PRESSO]: ", e$message)
+      })
+    }
+
+    if (isTRUE(cfg$run_coloc)) {
+      tryCatch({
+        exp_reg <- subset_exposure_region(exp1, protein_key_value, gene_chr, cis_start, cis_end)
+        out_reg <- subset_outcome_region(out1_best, gene_chr, cis_start, cis_end)
+
+        if (nrow(exp_reg) > 0 && nrow(out_reg) > 0) {
+          exp_reg <- exp_reg[
+            is.finite(beta) & is.finite(se) & se > 0 &
+              is.finite(eaf) & eaf > 0 & eaf < 1 &
+              is_acgt_snp(effect_allele, other_allele)
+          ]
+          out_reg <- out_reg[
+            is.finite(beta) & is.finite(se) & se > 0 &
+              is.finite(eaf) & eaf > 0 & eaf < 1 &
+              is_acgt_snp(effect_allele, other_allele)
+          ]
+
+          exp_reg <- deduplicate_by_snp(exp_reg)
+          out_reg <- deduplicate_by_snp(out_reg)
+
+          common_reg <- intersect(exp_reg$snp, out_reg$snp)
+          if (length(common_reg) >= 10L) {
+            exp_reg <- exp_reg[snp %chin% common_reg]
+            out_reg <- out_reg[snp %chin% common_reg]
+
+            exp_reg_dat <- format_tsmr_data(exp_reg, type = "exposure", label = exposure_name)
+            out_reg_dat <- format_tsmr_data(out_reg, type = "outcome", label = cfg$outcome_name)
+
+            reg_h <- harmonise_data(exp_reg_dat, out_reg_dat, action = cfg$harmonise_action)
+            reg_h <- drop_palindromic_harmonised(reg_h)
+            reg_h <- reg_h[reg_h$mr_keep == TRUE, ]
+
+            if (nrow(reg_h) >= 10L) {
+              D1 <- list(
+                type = "quant",
+                snp = reg_h$SNP,
+                beta = reg_h$beta.exposure,
+                varbeta = (reg_h$se.exposure)^2,
+                MAF = pmin(reg_h$eaf.exposure, 1 - reg_h$eaf.exposure)
+              )
+
+              if ("samplesize.exposure" %in% names(reg_h)) {
+                N1 <- suppressWarnings(as.numeric(reg_h$samplesize.exposure))
+                if (any(is.finite(N1))) D1$N <- round(median(N1[is.finite(N1)]))
+              }
+
+              D2 <- list(
+                type = cfg$outcome_type_coloc,
+                snp = reg_h$SNP,
+                beta = reg_h$beta.outcome,
+                varbeta = (reg_h$se.outcome)^2,
+                MAF = pmin(reg_h$eaf.outcome, 1 - reg_h$eaf.outcome)
+              )
+
+              if (is.finite(cfg$outcome_N)) D2$N <- cfg$outcome_N
+              if (identical(cfg$outcome_type_coloc, "cc") && is.finite(cfg$outcome_s)) D2$s <- cfg$outcome_s
+
+              coloc_res <- NULL
+              if (identical(cfg$outcome_type_coloc, "cc") && !is.finite(cfg$outcome_s)) {
+                s_grid <- c(0.05, 0.10, 0.20)
+                coloc_list <- lapply(s_grid, function(s) {
+                  D2i <- D2
+                  D2i$s <- s
+                  coloc.abf(D1, D2i)
+                })
+
+                coloc_sum <- rbindlist(lapply(seq_along(coloc_list), function(i) {
+                  data.table(s = s_grid[i], t(coloc_list[[i]]$summary))
+                }), fill = TRUE)
+
+                safe_write_tsv(coloc_sum, file.path(outdir, paste0(protein_of_interest, "_coloc_summary_sgrid.tsv")))
+                coloc_res <- coloc_list[[2]]
+              } else {
+                coloc_res <- coloc.abf(D1, D2)
+              }
+
+              coloc_summary <- as.data.table(t(coloc_res$summary))
+              coloc_summary[, `:=`(
+                protein = protein_of_interest,
+                cis_kb = cfg$cis_kb,
+                chr = gene_chr,
+                start = cis_start,
+                end = cis_end
+              )]
+
+              coloc_snps <- as.data.table(coloc_res$results)
+              coloc_snps[, protein := protein_of_interest]
+
+              safe_write_tsv(coloc_summary, file.path(outdir, paste0(protein_of_interest, "_coloc_summary.tsv")))
+              safe_write_tsv(coloc_snps, file.path(outdir, paste0(protein_of_interest, "_coloc_snps.tsv")))
+            }
+          }
+        }
+      }, error = function(e) {
+        optional_failures <<- rbind(
+          optional_failures,
+          data.table(step = "Coloc", message = e$message),
+          fill = TRUE
+        )
+        message("Optional step failed for ", protein_of_interest, " [Coloc]: ", e$message)
+      })
+    }
+
+    if (!is.null(mr_res) && nrow(d1) > 1) {
+      tryCatch({
+        p_scatter <- mr_scatter_plot(mr_out, d1)
+        ggsave(file.path(outdir, "mr_scatter.png"), p_scatter[[1]], width = 6, height = 5, dpi = 200)
+      }, error = function(e) {
+        optional_failures <<- rbind(
+          optional_failures,
+          data.table(step = "MR scatter plot", message = e$message),
+          fill = TRUE
+        )
+        message("Optional step failed for ", protein_of_interest, " [MR scatter plot]: ", e$message)
+      })
+
+      tryCatch({
+        make_mr_methods_forest_caption(
+          mr_res = mr_res,
+          title = exposure_name,
+          outfile = file.path(outdir, paste0("mr_forest_methods_", protein_of_interest, ".png")),
+          plot_on = "or",
+          auto_xlim = TRUE,
+          xlim_exclude = c("MR Egger"),
+          caption = paste0("Forest plot of MR OR estimates for ", exposure_name, ".")
+        )
+      }, error = function(e) {
+        message("Methods forest plot skipped for ", protein_of_interest, ": ", e$message)
+      })
+    }
+
+    tryCatch({
+      singlesnp_res <- mr_singlesnp(dat_h)
+      p_forest <- mr_forest_plot(singlesnp_res)
+      ggsave(file.path(outdir, "mr_forest_singlesnp.png"), p_forest[[1]], width = 7, height = 7, dpi = 200)
+    }, error = function(e) {
+      optional_failures <<- rbind(
+        optional_failures,
+        data.table(step = "Single-SNP forest plot", message = e$message),
+        fill = TRUE
+      )
+      message("Optional step failed for ", protein_of_interest, " [Single-SNP forest plot]: ", e$message)
+    })
+
+    if (!is.null(loo)) {
+      tryCatch({
+        p_loo <- mr_leaveoneout_plot(loo)
+        ggsave(file.path(outdir, "mr_leaveoneout.png"), p_loo[[1]], width = 7, height = 6, dpi = 200)
+      }, error = function(e) {
+        optional_failures <<- rbind(
+          optional_failures,
+          data.table(step = "Leave-one-out plot", message = e$message),
+          fill = TRUE
+        )
+        message("Optional step failed for ", protein_of_interest, " [Leave-one-out plot]: ", e$message)
+      })
+    }
+
+    if (nrow(optional_failures) > 0) {
+      safe_write_tsv(optional_failures, file.path(outdir, "optional_step_failures.tsv"))
+    }
+
+    list(
+      protein = protein_of_interest,
+      ok = !is.null(mr_res) && nrow(mr_res) > 0,
+      nsnp = nsnp,
+      outdir = outdir,
+      mr_table = mr_res,
+      steiger_summary = steiger_summary,
+      mr_presso_main = mr_presso_main,
+      mr_presso_global = mr_presso_global,
+      coloc_summary = coloc_summary,
+      diag = instrument_diag_complete(diag, status_value = "ok")
+    )
+  }, error = function(e) {
+    if (is.na(diag_fail_step)) diag_fail_step <<- "unhandled"
+    if (is.na(diag_fail_message) || !nzchar(diag_fail_message)) {
+      diag_fail_message <<- conditionMessage(e)
+    }
+    message("FAILED for ", protein_of_interest, ": ", conditionMessage(e))
+
+    list(
+      protein = protein_of_interest,
+      ok = FALSE,
+      error = conditionMessage(e),
+      nsnp = nsnp,
+      outdir = outdir,
+      mr_table = NULL,
+      steiger_summary = NULL,
+      mr_presso_main = NULL,
+      mr_presso_global = NULL,
+      coloc_summary = NULL,
+      diag = instrument_diag_complete(
+        diag,
+        status_value = "failed",
+        fail_step_value = diag_fail_step,
+        fail_message_value = diag_fail_message
+      )
+    )
+  })
+}
+```
+
+## Step 3: Run All Proteins
+
+```{r step3_run_all}
+run_one_protein_index <- function(i) {
+  run_one_protein(
+    protein_of_interest = protein_settings$protein[[i]],
+    gene_chr = protein_settings$gene_chr[[i]],
+    gene_pos = protein_settings$gene_pos[[i]],
+    exp1 = exp1,
+    out1 = out1,
+    out1_best = out1_best,
+    bim = bim,
+    ld_bfile = ld_bfile,
+    cfg = cfg
+  )
+}
+
+if (cfg$n_workers > 1L && .Platform$OS.type == "unix") {
+  results <- parallel::mclapply(
+    seq_len(nrow(protein_settings)),
+    run_one_protein_index,
+    mc.cores = cfg$n_workers
+  )
+} else {
+  results <- lapply(seq_len(nrow(protein_settings)), run_one_protein_index)
+}
+
+names(results) <- protein_settings$protein
+results <- results[protein_settings$protein]
+
+diag_rows <- lapply(results, function(x) x$diag)
+diag_rows <- Filter(Negate(is.null), diag_rows)
+tryCatch(
+  instrument_diag_write(diag_rows, cfg$outdir_base),
+  error = function(e) message("Instrument audit write failed: ", e$message)
+)
+
+# -- Combined MR results --
+ok_results <- results[vapply(results, function(x) isTRUE(x$ok), logical(1))]
+if (length(ok_results) > 0) {
+  mr_tables <- lapply(ok_results, function(x) as.data.table(x$mr_table))
+  mr_all <- rbindlist(mr_tables, fill = TRUE)
+  mr_all <- mr_all[order(pval)]
+
+  mr_all[, p_fdr_by_method := p.adjust(pval, method = "fdr"), by = method]
+  mr_all[, p_fdr_primary := NA_real_]
+  mr_all[method %in% c("Inverse variance weighted", "Wald ratio"), p_fdr_primary := p.adjust(pval, method = "fdr")]
+
+  safe_write_tsv(mr_all, file.path(cfg$outdir_base, "MR_all_proteins_summary.tsv"))
+  mr_primary <- mr_all[method %in% c("Inverse variance weighted", "Wald ratio")]
+  safe_write_tsv(mr_primary, file.path(cfg$outdir_base, "MR_primary_methods_summary.tsv"))
+  print(mr_all)
+} else {
+  cat("No successful protein runs for MR summary.\n")
+}
+
+# -- Steiger directionality --
+if (isTRUE(cfg$run_steiger)) {
+  steiger_tables <- lapply(ok_results, function(x) x$steiger_summary)
+  steiger_tables <- Filter(Negate(is.null), steiger_tables)
+
+  if (length(steiger_tables) > 0) {
+    steiger_all <- rbindlist(steiger_tables, fill = TRUE)
+    safe_write_tsv(steiger_all, file.path(cfg$outdir_base, "Steiger_all_proteins_summary.tsv"))
+    print(steiger_all)
+  } else {
+    cat("No Steiger summaries available to combine.\n")
+  }
+}
+
+# -- MR-PRESSO results --
+if (isTRUE(cfg$run_mr_presso)) {
+  presso_main_tables <- lapply(ok_results, function(x) x$mr_presso_main)
+  presso_main_tables <- Filter(Negate(is.null), presso_main_tables)
+
+  if (length(presso_main_tables) > 0) {
+    presso_main_all <- rbindlist(presso_main_tables, fill = TRUE)
+    safe_write_tsv(presso_main_all, file.path(cfg$outdir_base, "MRPRESSO_all_proteins_main.tsv"))
+    print(presso_main_all)
+  } else {
+    cat("No MR-PRESSO main summaries available to combine.\n")
+  }
+
+  presso_global_tables <- lapply(ok_results, function(x) x$mr_presso_global)
+  presso_global_tables <- Filter(Negate(is.null), presso_global_tables)
+
+  if (length(presso_global_tables) > 0) {
+    presso_global_all <- rbindlist(presso_global_tables, fill = TRUE)
+    safe_write_tsv(presso_global_all, file.path(cfg$outdir_base, "MRPRESSO_all_proteins_global.tsv"))
+    print(presso_global_all)
+  } else {
+    cat("No MR-PRESSO global summaries available to combine.\n")
+  }
+}
+
+# -- Colocalization results --
+if (isTRUE(cfg$run_coloc)) {
+  coloc_tables <- lapply(ok_results, function(x) x$coloc_summary)
+  coloc_tables <- Filter(Negate(is.null), coloc_tables)
+
+  if (length(coloc_tables) > 0) {
+    coloc_all <- rbindlist(coloc_tables, fill = TRUE)
+    safe_write_tsv(coloc_all, file.path(cfg$outdir_base, "Coloc_all_proteins_summary.tsv"))
+    print(coloc_all)
+  } else {
+    cat("No coloc summaries available to combine.\n")
+  }
+}
+
+# -- Failed proteins --
+fail_results <- results[vapply(results, function(x) isFALSE(x$ok), logical(1))]
+if (length(fail_results) > 0) {
+  fail_dt <- rbindlist(lapply(fail_results, function(x) {
+    diag_dt <- if (!is.null(x$diag)) {
+      as.data.table(x$diag)[, .(fail_step, fail_message)]
+    } else {
+      data.table(fail_step = NA_character_, fail_message = NA_character_)
+    }
+
+    cbind(
+      data.table(
+        protein = x$protein,
+        ok = x$ok,
+        error = x$error,
+        nsnp = x$nsnp,
+        outdir = x$outdir
+      ),
+      diag_dt
+    )
+  }), fill = TRUE)
+  safe_write_tsv(fail_dt, file.path(cfg$outdir_base, "MR_failed_runs.tsv"))
+  print(fail_dt)
+}
+
+cat("Run complete at:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+```
+
+## Session Info
+
+```{r session_info}
+sessionInfo()
+```
