@@ -6,8 +6,7 @@ date: "27/06/2026"
 
 # Set working directory
 ```{r}
-#setwd("/path/to/working/directory")
-setwd("/Users/raquelreal/Documents/Manuscripts/SomaScan/Test_code/")
+setwd("/path/to/working/directory")
 ```
 
 # Load libraries
